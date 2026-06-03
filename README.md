@@ -10,8 +10,7 @@ The name is short for "annotator."
 - Uses a custom Anny extension icon in Chrome.
 - Lets the user click a specific UI element and attach feedback to it.
 - Adds numbered annotation markers directly on the page.
-- Copies a structured markdown report with selector, DOM path, bounding box, viewport, nearby text, accessibility metadata, computed styles, and best-effort React/source hints when available.
-- Supports Compact, Standard, Detailed, and Forensic output levels.
+- Copies a lean agent-ready markdown report with a source URL, DOM base hash, robust anchors, human locators, scope, optional reference field, and cropped screenshot notes.
 - Stores annotations locally with `chrome.storage.local`.
 - Runs without a backend, account system, analytics, or network requests.
 
@@ -47,10 +46,9 @@ Chrome blocks extensions on internal pages such as `chrome://extensions` and `ch
 - Click the extension icon again, press `Esc`, or click **Close** to dismiss it.
 - Click **Annotate**, then click an element on the page.
 - Add feedback for the selected element.
-- Use **Copy** to copy markdown for implementation.
+- Use **Copy** to copy lean markdown for implementation.
 - Use **Markers** to hide or show marker bubbles.
 - Use **Motion** to pause CSS animations and media while annotating.
-- Use the output type field to choose Compact, Standard, Detailed, or Forensic before copying.
 - Use **Clear** to remove annotations for the current page.
 
 Keyboard shortcuts only work while the Anny toolbar is open:
@@ -64,19 +62,15 @@ Keyboard shortcuts only work while the Anny toolbar is open:
 
 When the toolbar is closed, Anny does not capture page keyboard shortcuts.
 
-## Output levels
+## Export
 
-- **Compact**: feedback, selector, and element summary.
-- **Standard**: adds DOM path, classes, React/source hints when available, and bounding box.
-- **Detailed**: adds selected text, nearby text, accessibility, attributes, nearby elements, and viewport.
-- **Forensic**: adds computed CSS and a JSON payload.
+Anny exports one agent-ready Markdown prompt. It includes the verbatim intent, human target locator, robust anchor, nearby text, role/ARIA when present, scope, reference when present, and screenshot notes. Screenshot capture is automatic; when Chrome cannot provide a crop, the export says so explicitly.
 
 ## Limitations
 
 - React component and source detection is best-effort and depends on development React internals being present.
 - Browser security rules prevent annotation on Chrome internal pages.
 - Cross-origin iframes are not annotated because the extension only injects into the top frame.
-- Computed style export is intentionally scoped to useful layout and visual properties rather than every CSS property.
 
 ## Development
 

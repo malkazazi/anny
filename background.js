@@ -7,12 +7,24 @@ const EXTENSION_MESSAGES = new Set([
   "annotator:toggle-markers",
   "annotator:toggle-pause",
   "annotator:clear",
-  "annotator:export",
-  "annotator:set-detail"
+  "annotator:export"
 ]);
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || !EXTENSION_MESSAGES.has(message.type)) {
+    if (message?.type === "annotator:capture-visible-tab") {
+      captureVisibleTab(sender)
+        .then(sendResponse)
+        .catch((error) => {
+          sendResponse({
+            ok: false,
+            error: error.message || "Unable to capture visible tab."
+          });
+        });
+
+      return true;
+    }
+
     return false;
   }
 
@@ -45,6 +57,12 @@ async function sendToActiveTab(message) {
 
   await ensureContentScript(tab.id);
   return chrome.tabs.sendMessage(tab.id, message);
+}
+
+async function captureVisibleTab(sender) {
+  const windowId = sender.tab?.windowId ?? chrome.windows.WINDOW_ID_CURRENT;
+  const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
+  return { ok: true, dataUrl };
 }
 
 async function ensureContentScript(tabId) {

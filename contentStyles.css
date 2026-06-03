@@ -143,13 +143,11 @@ html.local-annotator-paused *::after {
   background: var(--local-annotator-text);
 }
 
-.local-annotator-toolbar button,
-.local-annotator-detail {
+.local-annotator-toolbar button {
   position: relative;
 }
 
-.local-annotator-toolbar button::after,
-.local-annotator-detail::after {
+.local-annotator-toolbar button::after {
   content: attr(data-tooltip);
   position: absolute;
   right: 0;
@@ -174,15 +172,9 @@ html.local-annotator-paused *::after {
   white-space: normal;
 }
 
-.local-annotator-toolbar button:hover::after,
-.local-annotator-detail:hover:not(.is-tooltip-suppressed)::after {
+.local-annotator-toolbar button:hover::after {
   opacity: 1;
   transform: translateY(0);
-}
-
-.local-annotator-detail.is-tooltip-suppressed::after {
-  opacity: 0;
-  transform: translateY(3px);
 }
 
 .local-annotator-lucide {
@@ -199,40 +191,6 @@ html.local-annotator-paused *::after {
 .local-annotator-toolbar span {
   color: var(--local-annotator-muted);
   font: 400 12px/1 var(--local-annotator-font);
-}
-
-.local-annotator-detail {
-  display: flex;
-  width: 98px;
-  min-height: 34px;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border: 1px solid var(--local-annotator-line);
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.04);
-}
-
-.local-annotator-detail select {
-  all: initial;
-  appearance: none;
-  -webkit-appearance: none;
-  box-sizing: border-box;
-  display: block;
-  width: 100%;
-  height: 24px;
-  color: var(--local-annotator-text);
-  background: transparent;
-  cursor: pointer;
-  font: 400 12px/1 var(--local-annotator-font);
-  padding: 0;
-  text-align: center;
-  text-align-last: center;
-}
-
-.local-annotator-detail select:focus {
-  outline: 1px solid var(--local-annotator-line-strong);
-  outline-offset: 2px;
 }
 
 .local-annotator-composer {
@@ -254,6 +212,12 @@ html.local-annotator-paused *::after {
 .local-annotator-composer textarea,
 .local-annotator-composer summary,
 .local-annotator-composer pre {
+  all: revert;
+  box-sizing: border-box;
+  font-family: var(--local-annotator-font);
+}
+
+.local-annotator-composer input {
   all: revert;
   box-sizing: border-box;
   font-family: var(--local-annotator-font);
@@ -286,18 +250,64 @@ html.local-annotator-paused *::after {
 }
 
 .local-annotator-composer textarea:focus,
-.local-annotator-composer select:focus {
+.local-annotator-composer select:focus,
+.local-annotator-composer input:focus {
   border-color: var(--local-annotator-line-strong);
 }
 
-.local-annotator-composer select {
+.local-annotator-composer select,
+.local-annotator-composer input {
   width: 100%;
-  height: 34px;
   border: 1px solid var(--local-annotator-line);
   border-radius: 7px;
   color: var(--local-annotator-text);
   background: var(--local-annotator-panel-2);
+  outline: none;
   font-size: 12px;
+}
+
+.local-annotator-composer select,
+.local-annotator-composer input {
+  height: 34px;
+  padding: 0 9px;
+}
+
+.local-annotator-composer label {
+  display: grid;
+  gap: 5px;
+  color: var(--local-annotator-muted);
+  font: 400 11px/1.2 var(--local-annotator-font);
+}
+
+.local-annotator-composer label > span {
+  color: var(--local-annotator-muted);
+  font: 400 11px/1.2 var(--local-annotator-font);
+}
+
+.local-annotator-reference-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+}
+
+.local-annotator-reference-row button {
+  display: inline-grid;
+  grid-auto-flow: column;
+  min-width: 74px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid var(--local-annotator-line);
+  border-radius: 7px;
+  color: var(--local-annotator-text);
+  background: var(--local-annotator-panel-2);
+  cursor: pointer;
+  padding: 0 9px;
+  font: 400 12px/1 var(--local-annotator-font);
+}
+
+.local-annotator-reference-row button:hover {
+  border-color: var(--local-annotator-line-strong);
 }
 
 .local-annotator-composer details {

@@ -83,9 +83,15 @@ if (backgroundSource.includes("chrome.commands")) {
 }
 
 const contentSource = fs.readFileSync(path.join(root, "contentScript.js"), "utf8");
-for (const required of ["annotator:toggle-toolbar", "data-action=\"close\"", "data-action=\"detail\"", "data-tooltip", "detailOptions"]) {
+for (const required of ["annotator:toggle-toolbar", "data-action=\"close\"", "data-tooltip", "formatAgentMarkdown", "formatMarkdown", "captureElementShot(snapshot)"]) {
   if (!contentSource.includes(required)) {
     throw new Error(`contentScript.js is missing toolbar support: ${required}`);
+  }
+}
+
+for (const removed of ["format" + "For" + "ensicMarkdown", "mode" + "Options", "computed" + "StylesText", "AFS-like" + " JSON", "data-action=\"settings\"", "batch" + "Goal", "include" + "Screenshots", "name=\"des" + "ired\"", "name=\"gr" + "oup\""]) {
+  if (contentSource.includes(removed)) {
+    throw new Error(`contentScript.js should not include removed verbose export support: ${removed}`);
   }
 }
 
