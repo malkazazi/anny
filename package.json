@@ -1,0 +1,9 @@
+{
+  "name": "anny",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local Chrome extension for click-to-annotate UI feedback and structured implementation-note export.",
+  "scripts": {
+    "validate": "node scripts/validate-extension.js"
+  }
+}

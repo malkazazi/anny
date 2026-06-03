@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Anny",
+  "description": "Click page elements, add local UI feedback, and copy structured implementation notes for AI-assisted development.",
+  "version": "0.1.0",
+  "action": {
+    "default_title": "Open Anny"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": ["activeTab", "clipboardWrite", "scripting", "storage"],
+  "web_accessible_resources": [
+    {
+      "resources": ["fonts/Geist-Regular.woff2"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
