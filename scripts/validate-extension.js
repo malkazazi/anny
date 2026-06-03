@@ -7,6 +7,11 @@ const requiredFiles = [
   "manifest.json",
   "background.js",
   "fonts/Geist-Regular.woff2",
+  "icons/anny-icon.png",
+  "icons/icon-16.png",
+  "icons/icon-32.png",
+  "icons/icon-48.png",
+  "icons/icon-128.png",
   "contentScript.js",
   "contentStyles.css",
   "README.md"
@@ -34,6 +39,28 @@ if (manifest.host_permissions || manifest.content_scripts) {
 
 if (manifest.commands) {
   throw new Error("manifest.json should not define browser-level keyboard commands; shortcuts must be page-scoped and toolbar-gated");
+}
+
+const expectedIcons = {
+  "16": "icons/icon-16.png",
+  "32": "icons/icon-32.png",
+  "48": "icons/icon-48.png",
+  "128": "icons/icon-128.png"
+};
+
+for (const [size, iconPath] of Object.entries(expectedIcons)) {
+  if (manifest.icons?.[size] !== iconPath) {
+    throw new Error(`manifest.json must define icons.${size} as ${iconPath}`);
+  }
+
+  if (manifest.action?.default_icon?.[size] !== iconPath) {
+    throw new Error(`manifest.json must define action.default_icon.${size} as ${iconPath}`);
+  }
+
+  const dimensions = readPngDimensions(path.join(root, iconPath));
+  if (dimensions.width !== Number(size) || dimensions.height !== Number(size)) {
+    throw new Error(`${iconPath} must be ${size}x${size}px, found ${dimensions.width}x${dimensions.height}px`);
+  }
 }
 
 const webResources = JSON.stringify(manifest.web_accessible_resources || []);
@@ -73,3 +100,16 @@ for (const verboseTooltip of ["Annotate:", "Markers:", "Pause motion:", "Copy:",
 }
 
 console.log("Extension validation passed.");
+
+function readPngDimensions(filePath) {
+  const buffer = fs.readFileSync(filePath);
+  const pngSignature = "89504e470d0a1a0a";
+  if (buffer.subarray(0, 8).toString("hex") !== pngSignature) {
+    throw new Error(`${path.relative(root, filePath)} is not a PNG file`);
+  }
+
+  return {
+    width: buffer.readUInt32BE(16),
+    height: buffer.readUInt32BE(20)
+  };
+}

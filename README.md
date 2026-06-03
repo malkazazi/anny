@@ -7,6 +7,7 @@ The name is short for "annotator."
 ## What it does
 
 - Opens as a minimized toolbar in the bottom-right corner of the active page.
+- Uses a custom Anny extension icon in Chrome.
 - Lets the user click a specific UI element and attach feedback to it.
 - Adds numbered annotation markers directly on the page.
 - Copies a structured markdown report with selector, DOM path, bounding box, viewport, nearby text, accessibility metadata, computed styles, and best-effort React/source hints when available.
