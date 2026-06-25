@@ -10,7 +10,7 @@ The name is short for "annotator."
 - Uses a custom Anny extension icon in Chrome.
 - Lets the user click a specific UI element and attach feedback to it.
 - Adds numbered annotation markers directly on the page.
-- Copies a lean agent-ready markdown report with a source URL, DOM base hash, robust anchors, human locators, scope, optional reference field, and cropped screenshot notes.
+- Copies a lean agent-ready markdown report with a source URL, DOM base hash, robust anchors, structural DOM paths, target hashes, scope, optional structured reference context, style/box context, and cropped screenshot data when available.
 - Stores annotations locally with `chrome.storage.local`.
 - Runs without a backend, account system, analytics, or network requests.
 
@@ -46,10 +46,11 @@ Chrome blocks extensions on internal pages such as `chrome://extensions` and `ch
 - Click the extension icon again, press `Esc`, or click **Close** to dismiss it.
 - Click **Annotate**, then click an element on the page.
 - Add feedback for the selected element.
+- In the Reference field, use **Pick** to start a reference picker. Navigate normally to the reference UI, click **Capture**, then click the reference element; Anny saves it back to the original annotation.
 - Use **Copy** to copy lean markdown for implementation.
 - Use **Markers** to hide or show marker bubbles.
 - Use **Motion** to pause CSS animations and media while annotating.
-- Use **Clear** to remove annotations for the current page.
+- Use **Clear** and confirm **Clear?** to remove annotations for the current page.
 
 Keyboard shortcuts only work while the Anny toolbar is open:
 
@@ -64,7 +65,7 @@ When the toolbar is closed, Anny does not capture page keyboard shortcuts.
 
 ## Export
 
-Anny exports one agent-ready Markdown prompt. It includes the verbatim intent, human target locator, robust anchor, nearby text, role/ARIA when present, scope, reference when present, and screenshot notes. Screenshot capture is automatic; when Chrome cannot provide a crop, the export says so explicitly.
+Anny exports one agent-ready Markdown prompt. It includes the compatibility `intent`, split `observation` and `desiredState`, change type, cascade flag, human target locator, robust anchor, structural DOM path, target hash, nearby text, full target HTML snippet, role/ARIA when present, scope, reference pattern/example when present, box/style context, and screenshot data or explicit failure notes. Screenshot capture is automatic; when Chrome cannot provide a crop, the export says so explicitly.
 
 ## Limitations
 

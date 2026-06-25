@@ -78,12 +78,16 @@ if (!backgroundSource.includes("chrome.action.onClicked") || !backgroundSource.i
   throw new Error("background.js must toggle the in-page toolbar from the extension icon");
 }
 
+if (!backgroundSource.includes("chrome.tabs.onUpdated") || !backgroundSource.includes("annotator:reference-picker-started")) {
+  throw new Error("background.js must resume pending reference pickers after same-tab page loads");
+}
+
 if (backgroundSource.includes("chrome.commands")) {
   throw new Error("background.js should not register global Chrome keyboard commands");
 }
 
 const contentSource = fs.readFileSync(path.join(root, "contentScript.js"), "utf8");
-for (const required of ["annotator:toggle-toolbar", "data-action=\"close\"", "data-tooltip", "formatAgentMarkdown", "formatMarkdown", "captureElementShot(snapshot)"]) {
+for (const required of ["annotator:toggle-toolbar", "data-action=\"close\"", "data-tooltip", "formatAgentMarkdown", "formatMarkdown", "captureElementShot(snapshot)", "anny:reference-picker", "renderReferencePicker", "data-reference-action=\"capture\"", "local-annotator-clear-confirm", "data-clear-confirm=\"yes\"", "TOP_LAYER_HOST_SELECTOR", "event.composedPath", "annotatorHostForElement", "watchOverlayLayerChanges", "syncAnnotatorUiLayer", "activeAnnotatorHost", "onTopLayerToggle", "data-toolbar-drag", "onToolbarPointerDown", "toolbarPosition", "setPointerCapture", "releasePointerCapture", "placeClearConfirm", "ANNOTATOR_CHROME_SELECTOR", "underlyingElementFromPoint"]) {
   if (!contentSource.includes(required)) {
     throw new Error(`contentScript.js is missing toolbar support: ${required}`);
   }

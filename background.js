@@ -1,3 +1,5 @@
+const REFERENCE_PICKER_KEY = "anny:reference-picker";
+
 const EXTENSION_MESSAGES = new Set([
   "annotator:get-state",
   "annotator:open-toolbar",
@@ -11,20 +13,38 @@ const EXTENSION_MESSAGES = new Set([
 ]);
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || !EXTENSION_MESSAGES.has(message.type)) {
-    if (message?.type === "annotator:capture-visible-tab") {
-      captureVisibleTab(sender)
-        .then(sendResponse)
-        .catch((error) => {
-          sendResponse({
-            ok: false,
-            error: error.message || "Unable to capture visible tab."
-          });
+  if (message?.type === "annotator:capture-visible-tab") {
+    captureVisibleTab(sender)
+      .then(sendResponse)
+      .catch((error) => {
+        sendResponse({
+          ok: false,
+          error: error.message || "Unable to capture visible tab."
         });
+      });
 
-      return true;
-    }
+    return true;
+  }
 
+  if (message?.type === "annotator:reference-picker-started") {
+    rememberReferencePickerTab(sender)
+      .then(sendResponse)
+      .catch((error) => {
+        sendResponse({
+          ok: false,
+          error: error.message || "Unable to remember the reference picker tab."
+        });
+      });
+
+    return true;
+  }
+
+  if (message?.type === "annotator:reference-picker-ended") {
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (!message || !EXTENSION_MESSAGES.has(message.type)) {
     return false;
   }
 
@@ -42,6 +62,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 chrome.action.onClicked.addListener(async () => {
   await sendToActiveTab({ type: "annotator:toggle-toolbar" }).catch(() => {});
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== "complete") {
+    return;
+  }
+
+  resumeReferencePicker(tabId).catch(() => {});
 });
 
 async function sendToActiveTab(message) {
@@ -63,6 +91,36 @@ async function captureVisibleTab(sender) {
   const windowId = sender.tab?.windowId ?? chrome.windows.WINDOW_ID_CURRENT;
   const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: "png" });
   return { ok: true, dataUrl };
+}
+
+async function rememberReferencePickerTab(sender) {
+  const tabId = sender.tab?.id;
+  if (!tabId) {
+    return { ok: false, error: "No source tab found." };
+  }
+
+  const stored = await chrome.storage.local.get(REFERENCE_PICKER_KEY);
+  const picker = stored[REFERENCE_PICKER_KEY];
+  if (picker?.id) {
+    await chrome.storage.local.set({
+      [REFERENCE_PICKER_KEY]: {
+        ...picker,
+        tabId
+      }
+    });
+  }
+
+  return { ok: true };
+}
+
+async function resumeReferencePicker(tabId) {
+  const stored = await chrome.storage.local.get(REFERENCE_PICKER_KEY);
+  const picker = stored[REFERENCE_PICKER_KEY];
+  if (!picker?.id || picker.tabId !== tabId) {
+    return;
+  }
+
+  await ensureContentScript(tabId);
 }
 
 async function ensureContentScript(tabId) {

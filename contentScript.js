@@ -7,9 +7,13 @@
 
   const PAGE_PREFIX = "anny:page:";
   const SETTINGS_KEY = "anny:settings";
+  const REFERENCE_PICKER_KEY = "anny:reference-picker";
   const MAX_TEXT = 700;
-  const SHOT_MAX_WIDTH = 480;
-  const SHOT_MAX_BYTES = 150 * 1024;
+  const SHOT_MAX_LONG_EDGE = 480;
+  const SHOT_DEFAULT_MAX_BYTES = 512 * 1024;
+  const SHOT_MIN_MAX_BYTES = 96 * 1024;
+  const SHOT_JPEG_QUALITY = 0.6;
+  const CHANGE_TYPES = ["copy", "color", "layout", "spacing", "data-value", "structure"];
   const STABLE_DATA_ATTRIBUTES = [
     "data-testid",
     "data-test",
@@ -21,10 +25,25 @@
     "data-name",
     "data-role"
   ];
+  const ANNOTATOR_CHROME_SELECTOR = [
+    ".local-annotator-hover-ring",
+    ".local-annotator-target-ring",
+    ".local-annotator-marker",
+    ".local-annotator-composer",
+    ".local-annotator-toast",
+    ".local-annotator-toolbar",
+    ".local-annotator-reference-picker",
+    ".local-annotator-clear-confirm"
+  ].join(", ");
+  const ANNOTATOR_ELEMENT_SELECTOR = ANNOTATOR_CHROME_SELECTOR;
+  const TOP_LAYER_HOST_SELECTOR = "dialog[open], [popover]";
 
   const defaultSettings = {
     markersVisible: true,
-    animationsPaused: false
+    animationsPaused: false,
+    dropAppliedAnnotations: false,
+    shotMaxBytes: SHOT_DEFAULT_MAX_BYTES,
+    toolbarPosition: null
   };
 
   const state = {
@@ -33,6 +52,9 @@
     toolbarVisible: false,
     markersVisible: true,
     animationsPaused: false,
+    dropAppliedAnnotations: false,
+    shotMaxBytes: SHOT_DEFAULT_MAX_BYTES,
+    toolbarPosition: null,
     baseHash: "",
     baseCapturedAt: "",
     referencePicker: null,
@@ -44,12 +66,17 @@
     targetRing: null,
     composer: null,
     toolbar: null,
+    clearConfirm: null,
+    referencePicker: null,
     toast: null
   };
 
   let currentPageKey = pageKey();
   let hoveredElement = null;
   let lastSelection = null;
+  let overlayLayerObserver = null;
+  let overlayLayerFrame = 0;
+  let toolbarDrag = null;
   const mediaPausedByAnnotator = new Set();
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -69,17 +96,21 @@
   document.addEventListener("click", onDocumentClick, true);
   document.addEventListener("keydown", onKeyDown, true);
   document.addEventListener("selectionchange", rememberSelection);
+  document.addEventListener("toggle", onTopLayerToggle, true);
   window.addEventListener("scroll", syncHoverRing, true);
-  window.addEventListener("resize", syncHoverRing);
+  window.addEventListener("resize", onViewportResize);
 
   init();
 
   async function init() {
     await loadStateForPage();
     renderToolbar();
+    renderReferencePicker();
     renderMarkers();
     applyPausedState();
     watchUrlChanges();
+    watchOverlayLayerChanges();
+    syncAnnotatorUiLayer();
   }
 
   async function handleRuntimeMessage(message) {
@@ -93,7 +124,7 @@
 
     if (message.type === "annotator:open-toolbar") {
       state.toolbarVisible = true;
-      state.feedbackEnabled = true;
+      state.feedbackEnabled = !state.referencePicker;
       closeComposer();
       renderToolbar();
       syncHoverRing();
@@ -105,7 +136,7 @@
         closeToolbar();
       } else {
         state.toolbarVisible = true;
-        state.feedbackEnabled = true;
+        state.feedbackEnabled = !state.referencePicker;
         closeComposer();
         renderToolbar();
         syncHoverRing();
@@ -114,6 +145,13 @@
     }
 
     if (message.type === "annotator:toggle-feedback") {
+      if (state.referencePicker) {
+        state.feedbackEnabled = false;
+        renderToolbar();
+        toast("Reference picker active. Use Capture to select the reference.");
+        return ok();
+      }
+
       state.toolbarVisible = true;
       state.feedbackEnabled = !state.feedbackEnabled;
       closeComposer();
@@ -124,7 +162,7 @@
     }
 
     if (message.type === "annotator:set-feedback") {
-      state.feedbackEnabled = Boolean(message.enabled);
+      state.feedbackEnabled = state.referencePicker ? false : Boolean(message.enabled);
       state.toolbarVisible = state.toolbarVisible || state.feedbackEnabled;
       closeComposer();
       renderToolbar();
@@ -150,6 +188,7 @@
     }
 
     if (message.type === "annotator:clear") {
+      closeClearConfirm();
       clearPageFeedback();
       await saveAnnotations();
       closeComposer();
@@ -163,10 +202,11 @@
         ensureBaseCapture();
         await saveAnnotations();
       }
+      const markdownExport = buildMarkdownExport(state.annotations);
       return {
         ok: true,
         state: publicState(),
-        markdown: formatMarkdown(state.annotations)
+        markdown: markdownExport.markdown
       };
     }
 
@@ -184,8 +224,11 @@
       toolbarVisible: state.toolbarVisible,
       markersVisible: state.markersVisible,
       animationsPaused: state.animationsPaused,
+      dropAppliedAnnotations: state.dropAppliedAnnotations,
+      shotMaxBytes: state.shotMaxBytes,
       baseHash: state.baseHash,
       baseCapturedAt: state.baseCapturedAt,
+      referencePickerActive: Boolean(state.referencePicker),
       url: location.href,
       title: document.title
     };
@@ -193,15 +236,23 @@
 
   async function loadStateForPage() {
     currentPageKey = pageKey();
-    const stored = await storageGet([currentPageKey, SETTINGS_KEY]);
+    const stored = await storageGet([currentPageKey, SETTINGS_KEY, REFERENCE_PICKER_KEY]);
     const page = stored[currentPageKey] || {};
     const settings = { ...defaultSettings, ...(stored[SETTINGS_KEY] || {}) };
 
     state.annotations = Array.isArray(page.annotations) ? page.annotations.map(stripRemovedAnnotationFields) : [];
     state.markersVisible = settings.markersVisible;
     state.animationsPaused = settings.animationsPaused;
+    state.dropAppliedAnnotations = Boolean(settings.dropAppliedAnnotations);
+    state.shotMaxBytes = normalizeShotMaxBytes(settings.shotMaxBytes);
+    state.toolbarPosition = normalizeToolbarPosition(settings.toolbarPosition);
     state.baseHash = typeof page.baseHash === "string" ? page.baseHash : "";
     state.baseCapturedAt = typeof page.baseCapturedAt === "string" ? page.baseCapturedAt : "";
+    state.referencePicker = normalizeReferencePicker(stored[REFERENCE_PICKER_KEY]);
+    if (state.referencePicker) {
+      state.toolbarVisible = true;
+      state.feedbackEnabled = false;
+    }
     state.url = location.href;
   }
 
@@ -222,7 +273,10 @@
     return storageSet({
       [SETTINGS_KEY]: {
         markersVisible: state.markersVisible,
-        animationsPaused: state.animationsPaused
+        animationsPaused: state.animationsPaused,
+        dropAppliedAnnotations: state.dropAppliedAnnotations,
+        shotMaxBytes: state.shotMaxBytes,
+        toolbarPosition: state.toolbarPosition
       }
     });
   }
@@ -235,11 +289,11 @@
   }
 
   function onMouseMove(event) {
-    if (!state.feedbackEnabled || isAnnotatorElement(event.target)) {
+    if (!(state.feedbackEnabled || state.referencePicker?.captureArmed) || isAnnotatorElement(event.target)) {
       return;
     }
 
-    const target = elementAt(event.clientX, event.clientY);
+    const target = elementAt(event.clientX, event.clientY, event);
     if (!target || target === document.documentElement || target === document.body) {
       hideHoverRing();
       return;
@@ -254,8 +308,10 @@
       return;
     }
 
-    if (state.referencePicker) {
-      const target = elementAt(event.clientX, event.clientY);
+    scheduleAnnotatorUiLayerSync();
+
+    if (state.referencePicker?.captureArmed) {
+      const target = elementAt(event.clientX, event.clientY, event);
       if (!target || target === document.documentElement) {
         return;
       }
@@ -264,10 +320,13 @@
       event.stopPropagation();
       event.stopImmediatePropagation();
 
-      const selector = getRobustSelectorInfo(target).selector;
-      state.referencePicker.input.value = selector;
-      state.referencePicker = null;
-      toast("Reference captured.");
+      captureReferenceTarget(target).catch(() => {
+        toast("Reference capture failed.");
+      });
+      return;
+    }
+
+    if (state.referencePicker) {
       return;
     }
 
@@ -275,7 +334,7 @@
       return;
     }
 
-    const target = elementAt(event.clientX, event.clientY);
+    const target = elementAt(event.clientX, event.clientY, event);
     if (!target || target === document.documentElement) {
       return;
     }
@@ -289,7 +348,7 @@
   }
 
   function onKeyDown(event) {
-    if (!state.toolbarVisible) {
+    if (!state.toolbarVisible && !state.referencePicker) {
       return;
     }
 
@@ -299,6 +358,12 @@
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
+      if (state.referencePicker) {
+        clearReferencePicker().then(() => {
+          toast("Reference picker cancelled.");
+        });
+        return;
+      }
       closeToolbar();
       return;
     }
@@ -311,6 +376,13 @@
 
     if (modifier && event.shiftKey && key === "f") {
       event.preventDefault();
+      if (state.referencePicker) {
+        state.feedbackEnabled = false;
+        renderToolbar();
+        toast("Reference picker active. Use Capture to select the reference.");
+        return;
+      }
+
       state.feedbackEnabled = !state.feedbackEnabled;
       closeComposer();
       renderToolbar();
@@ -345,6 +417,7 @@
 
     if (key === "x") {
       event.preventDefault();
+      closeClearConfirm();
       clearPageFeedback();
       saveAnnotations();
       renderMarkers();
@@ -367,6 +440,17 @@
     };
   }
 
+  function onTopLayerToggle(event) {
+    if (event.target instanceof Element && !isAnnotatorElement(event.target) && matchesSelector(event.target, TOP_LAYER_HOST_SELECTOR)) {
+      scheduleAnnotatorUiLayerSync();
+    }
+  }
+
+  function onViewportResize() {
+    syncHoverRing();
+    placeToolbar();
+  }
+
   function showHoverRing(element) {
     const rect = element.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) {
@@ -377,8 +461,8 @@
     if (!dom.hoverRing) {
       dom.hoverRing = document.createElement("div");
       dom.hoverRing.className = "local-annotator-hover-ring";
-      document.documentElement.appendChild(dom.hoverRing);
     }
+    appendAnnotatorNode(dom.hoverRing, annotatorHostForElement(element));
 
     Object.assign(dom.hoverRing.style, {
       left: `${Math.max(0, rect.left)}px`,
@@ -391,7 +475,7 @@
   }
 
   function syncHoverRing() {
-    if (!state.feedbackEnabled || !hoveredElement) {
+    if (!(state.feedbackEnabled || state.referencePicker?.captureArmed) || !hoveredElement) {
       hideHoverRing();
       return;
     }
@@ -409,8 +493,8 @@
     if (!dom.targetRing) {
       dom.targetRing = document.createElement("div");
       dom.targetRing.className = "local-annotator-target-ring";
-      document.documentElement.appendChild(dom.targetRing);
     }
+    appendAnnotatorNode(dom.targetRing, annotatorHostForElement(element));
 
     Object.assign(dom.targetRing.style, {
       left: `${Math.max(0, rect.left)}px`,
@@ -439,7 +523,27 @@
     composer.className = "local-annotator-composer";
     composer.innerHTML = `
       <strong title="${escapeAttr(snapshot.elementPath)}">${escapeHtml(snapshot.elementSummary)}</strong>
-      <textarea name="comment" placeholder="Describe the change you want the agent to make..." required>${escapeHtml(snapshot.comment || "")}</textarea>
+      <label>
+        <span>Observation</span>
+        <textarea name="observation" placeholder="What is wrong?" required>${escapeHtml(annotationObservation(snapshot))}</textarea>
+      </label>
+      <label>
+        <span>Desired state</span>
+        <textarea name="desiredState" placeholder="End state" required>${escapeHtml(annotationDesiredState(snapshot))}</textarea>
+        <small data-atomicity-warning hidden></small>
+      </label>
+      <div class="local-annotator-composer-row">
+        <label>
+          <span>Change type</span>
+          <select name="changeType">
+            ${changeTypeOptions(snapshot.changeType || inferChangeType(annotationIntent(snapshot)))}
+          </select>
+        </label>
+        <label class="local-annotator-check">
+          <input name="cascade" type="checkbox"${snapshot.cascade ? " checked" : ""}>
+          <span>Cascade</span>
+        </label>
+      </div>
       <label>
         <span>Scope</span>
         <select name="scope">
@@ -448,8 +552,9 @@
       </label>
       <label>
         <span>Reference</span>
+        <input name="referencePattern" value="${escapeAttr(snapshot.referencePattern || "")}" placeholder="Pattern">
         <div class="local-annotator-reference-row">
-          <input name="reference" value="${escapeAttr(snapshot.reference || "")}" placeholder="Selector, file path, or attached image">
+          <input name="reference" value="${escapeAttr(snapshot.reference || "")}" placeholder="Example location">
           <button type="button" data-pick-reference="true" aria-label="Pick reference element" title="Pick">${lucideIcon("mouse-pointer-2")}<span>Pick</span></button>
         </div>
       </label>
@@ -464,36 +569,68 @@
       </div>
     `;
 
-    document.documentElement.appendChild(composer);
+    appendAnnotatorNode(composer, annotatorHostForElement(element));
     dom.composer = composer;
     placeComposer(composer, clientX, clientY);
 
-    const textarea = composer.querySelector("textarea");
-    textarea.focus();
-    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
-    textarea.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter" || event.shiftKey || event.isComposing) {
-        return;
-      }
+    const observationField = composer.querySelector('textarea[name="observation"]');
+    const desiredStateField = composer.querySelector('textarea[name="desiredState"]');
+    observationField.focus();
+    observationField.setSelectionRange(observationField.value.length, observationField.value.length);
+    composer.querySelectorAll("textarea").forEach((textarea) => {
+      textarea.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" || event.shiftKey || event.isComposing) {
+          return;
+        }
 
-      event.preventDefault();
-      composer.requestSubmit();
+        event.preventDefault();
+        composer.requestSubmit();
+      });
     });
 
     composer.addEventListener("submit", async (event) => {
       event.preventDefault();
       const formData = new FormData(composer);
-      const comment = String(formData.get("comment") || "").trim();
-      if (!comment) {
-        textarea.focus();
+      const rawObservation = String(formData.get("observation") || "");
+      const rawDesiredState = String(formData.get("desiredState") || "");
+      const observation = normalizeWhitespace(rawObservation);
+      const desiredState = normalizeWhitespace(rawDesiredState);
+      if (!observation || !desiredState) {
+        (observation ? desiredStateField : observationField).focus();
         return;
       }
 
+      const atomicityMessage = atomicityIssueForDesiredState(rawDesiredState);
+      if (atomicityMessage) {
+        showAtomicityWarning(composer, atomicityMessage);
+        desiredStateField.focus();
+        toast("Split distinct changes into separate annotations.");
+        return;
+      }
+      showAtomicityWarning(composer, "");
+
+      const scope = normalizeScope(formData.get("scope"));
+      const targetForMetadata = targetElementForMetadata(existingAnnotation, element);
+      const targetMetadata = targetForMetadata ? collectTargetMetadata(targetForMetadata, scope, snapshot.matchSignature) : null;
+      const comment = composeIntent(observation, desiredState);
       const nextAnnotation = {
         ...snapshot,
         comment,
-        scope: normalizeScope(formData.get("scope")),
+        observation,
+        desiredState,
+        changeType: normalizeChangeType(formData.get("changeType"), comment),
+        cascade: formData.get("cascade") === "on",
+        scope,
+        referencePattern: normalizeWhitespace(formData.get("referencePattern")),
         reference: normalizeWhitespace(formData.get("reference")),
+        targetFingerprint: snapshot.targetFingerprint || targetMetadata?.targetFingerprint || "",
+        targetText: snapshot.targetText || targetMetadata?.targetText || "",
+        snippet: targetMetadata?.snippet || snapshot.snippet || "",
+        domPath: targetMetadata?.domPath || snapshot.domPath || null,
+        boundingBox: targetMetadata?.boundingBox || snapshot.boundingBox || null,
+        computedStyle: targetMetadata?.computedStyle || snapshot.computedStyle || null,
+        matchSignature: targetMetadata?.matchSignature || snapshot.matchSignature || "",
+        matchedSet: scope === "element" ? null : targetMetadata?.matchedSet || snapshot.matchedSet || null,
         updatedAt: new Date().toISOString()
       };
 
@@ -514,13 +651,10 @@
     });
 
     composer.querySelector("[data-cancel]")?.addEventListener("click", closeComposer);
-    composer.querySelector("[data-pick-reference]")?.addEventListener("click", (event) => {
+    composer.querySelector("[data-pick-reference]")?.addEventListener("click", async (event) => {
       event.preventDefault();
       event.stopPropagation();
-      state.referencePicker = {
-        input: composer.querySelector('input[name="reference"]')
-      };
-      toast("Click the element to match.");
+      await startReferencePicker(composer, snapshot, existingAnnotation);
     });
     composer.querySelector("[data-delete]")?.addEventListener("click", async () => {
       state.annotations = state.annotations.filter((annotation) => annotation.id !== existingAnnotation.id);
@@ -543,7 +677,6 @@
   }
 
   function closeComposer() {
-    state.referencePicker = null;
     dom.composer?.remove();
     dom.composer = null;
     hideTargetRing();
@@ -552,9 +685,312 @@
   function closeToolbar() {
     state.toolbarVisible = false;
     state.feedbackEnabled = false;
+    if (toolbarDrag) {
+      finishToolbarDrag(false);
+    }
+    closeComposer();
+    closeClearConfirm();
+    hideHoverRing();
+    renderToolbar();
+  }
+
+  function appendAnnotatorNode(node, host = document.documentElement) {
+    const nextHost = host?.isConnected ? host : document.documentElement;
+    if (node.parentElement !== nextHost || node.nextElementSibling) {
+      nextHost.appendChild(node);
+    }
+  }
+
+  function activeAnnotatorHost(preferredElement = null) {
+    return topLayerHostForElement(preferredElement) || activeTopLayerHost() || document.documentElement;
+  }
+
+  function annotatorHostForElement(element) {
+    return topLayerHostForElement(element) || document.documentElement;
+  }
+
+  function activeTopLayerHost() {
+    const hosts = Array.from(document.querySelectorAll(TOP_LAYER_HOST_SELECTOR)).filter((element) => {
+      return !isAnnotatorElement(element) && isOpenTopLayerHost(element);
+    });
+
+    return hosts[hosts.length - 1] || null;
+  }
+
+  function topLayerHostForElement(element) {
+    if (!(element instanceof Element)) {
+      return null;
+    }
+
+    const host = element.closest(TOP_LAYER_HOST_SELECTOR);
+    if (!host?.isConnected) {
+      return null;
+    }
+
+    if (isOpenTopLayerHost(host)) {
+      return host;
+    }
+
+    return null;
+  }
+
+  function isOpenTopLayerHost(element) {
+    return matchesSelector(element, "dialog[open]") || matchesSelector(element, ":popover-open");
+  }
+
+  function matchesSelector(element, selector) {
+    try {
+      return element instanceof Element && element.matches(selector);
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  function syncAnnotatorUiLayer() {
+    const host = activeAnnotatorHost();
+
+    if (state.toolbarVisible && dom.toolbar) {
+      appendAnnotatorNode(dom.toolbar, host);
+      placeToolbar();
+    }
+
+    if (dom.clearConfirm) {
+      appendAnnotatorNode(dom.clearConfirm, host);
+      placeClearConfirm();
+    }
+
+    if (dom.referencePicker) {
+      appendAnnotatorNode(dom.referencePicker, host);
+    }
+
+    if (dom.toast) {
+      appendAnnotatorNode(dom.toast, host);
+    }
+  }
+
+  function scheduleAnnotatorUiLayerSync() {
+    if (!state.toolbarVisible && !dom.clearConfirm && !dom.referencePicker && !dom.toast) {
+      return;
+    }
+
+    if (overlayLayerFrame) {
+      return;
+    }
+
+    overlayLayerFrame = window.requestAnimationFrame(() => {
+      overlayLayerFrame = 0;
+      syncAnnotatorUiLayer();
+    });
+  }
+
+  function watchOverlayLayerChanges() {
+    if (overlayLayerObserver) {
+      return;
+    }
+
+    overlayLayerObserver = new MutationObserver((mutations) => {
+      if (!mutations.some(shouldSyncAnnotatorLayerForMutation)) {
+        return;
+      }
+
+      scheduleAnnotatorUiLayerSync();
+    });
+
+    overlayLayerObserver.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["open", "popover", "aria-modal", "hidden"]
+    });
+  }
+
+  function shouldSyncAnnotatorLayerForMutation(mutation) {
+    if (!state.toolbarVisible && !dom.clearConfirm && !dom.referencePicker && !dom.toast) {
+      return false;
+    }
+
+    if (mutation.target instanceof Element && isAnnotatorElement(mutation.target)) {
+      return false;
+    }
+
+    if (mutation.type === "childList") {
+      return Array.from(mutation.addedNodes).some(isElementNode) || Array.from(mutation.removedNodes).some(isElementNode);
+    }
+
+    return mutation.target instanceof Element;
+  }
+
+  function isElementNode(node) {
+    return node instanceof Element && !isAnnotatorElement(node);
+  }
+
+  async function startReferencePicker(composer, snapshot, existingAnnotation) {
+    const now = new Date().toISOString();
+    const originBaseHash = state.baseHash || domSnapshotHash();
+    const originBaseCapturedAt = state.baseCapturedAt || now;
+    const picker = {
+      id: `ref_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+      originPageKey: currentPageKey,
+      originUrl: location.href,
+      originTitle: document.title,
+      originBaseHash,
+      originBaseCapturedAt,
+      annotationId: existingAnnotation?.id || snapshot.id,
+      draft: draftAnnotationFromComposer(composer, snapshot),
+      captureArmed: false,
+      startedAt: now,
+      updatedAt: now
+    };
+
+    state.baseHash = state.baseHash || originBaseHash;
+    state.baseCapturedAt = state.baseCapturedAt || originBaseCapturedAt;
+    state.referencePicker = picker;
+    state.feedbackEnabled = false;
+
+    await saveReferencePicker(picker);
+    await notifyReferencePickerStarted().catch(() => {});
     closeComposer();
     hideHoverRing();
     renderToolbar();
+    renderReferencePicker();
+    toast("Reference picker active. Navigate to the reference, then click Capture.");
+  }
+
+  function draftAnnotationFromComposer(composer, snapshot) {
+    const formData = new FormData(composer);
+    const observation = normalizeWhitespace(formData.get("observation"));
+    const desiredState = normalizeWhitespace(formData.get("desiredState"));
+    const comment = composeIntent(observation, desiredState);
+    return {
+      ...snapshot,
+      comment,
+      observation,
+      desiredState,
+      changeType: normalizeChangeType(formData.get("changeType"), comment),
+      cascade: formData.get("cascade") === "on",
+      scope: normalizeScope(formData.get("scope")),
+      referencePattern: normalizeWhitespace(formData.get("referencePattern")),
+      reference: normalizeWhitespace(formData.get("reference")),
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  async function captureReferenceTarget(target) {
+    const picker = state.referencePicker;
+    if (!picker) {
+      return;
+    }
+
+    const reference = referenceValueForTarget(target, picker);
+    await saveReferencePicker({ ...picker, captureArmed: false });
+    hideHoverRing();
+    renderReferencePicker();
+    await saveReferenceToOrigin(picker, reference);
+    await clearReferencePicker();
+    toast("Reference saved to the original annotation.");
+  }
+
+  async function saveReferenceToOrigin(picker, reference) {
+    const originPageKey = picker.originPageKey || currentPageKey;
+    const stored = await storageGet(originPageKey);
+    const page = stored[originPageKey] || {};
+    const annotations = Array.isArray(page.annotations) ? page.annotations.map(stripRemovedAnnotationFields) : [];
+    const now = new Date().toISOString();
+    const draft = stripRemovedAnnotationFields({
+      ...(picker.draft || {}),
+      id: picker.annotationId || picker.draft?.id || `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
+      url: picker.draft?.url || picker.originUrl || location.href,
+      title: picker.draft?.title || picker.originTitle || document.title,
+      reference,
+      updatedAt: now
+    });
+    const existingIndex = annotations.findIndex((annotation) => annotation.id === draft.id);
+
+    if (existingIndex >= 0) {
+      annotations[existingIndex] = stripRemovedAnnotationFields({
+        ...annotations[existingIndex],
+        ...draft
+      });
+    } else {
+      annotations.push(draft);
+    }
+
+    const baseHash = page.baseHash || picker.originBaseHash || "";
+    const baseCapturedAt = page.baseCapturedAt || picker.originBaseCapturedAt || "";
+    const nextPage = {
+      url: page.url || picker.originUrl || location.href,
+      title: page.title || picker.originTitle || document.title,
+      updatedAt: now,
+      baseHash,
+      baseCapturedAt,
+      annotations
+    };
+
+    await storageSet({ [originPageKey]: nextPage });
+
+    if (originPageKey === currentPageKey) {
+      state.annotations = annotations;
+      state.baseHash = baseHash;
+      state.baseCapturedAt = baseCapturedAt;
+      renderMarkers();
+      renderToolbar();
+    }
+  }
+
+  function referenceValueForTarget(target, picker) {
+    const selectorInfo = getRobustSelectorInfo(target);
+    const anchor = selectorInfo.positional ? `${selectorInfo.selector} (positional - may drift)` : selectorInfo.selector;
+    if (picker.originPageKey === currentPageKey) {
+      return anchor;
+    }
+
+    const locator = humanLocator(target);
+    const title = document.title || "Untitled page";
+    return `${title} - ${location.href} - ${locator} - anchor: ${anchor}`;
+  }
+
+  async function saveReferencePicker(picker) {
+    const nextPicker = {
+      ...picker,
+      updatedAt: new Date().toISOString()
+    };
+    const stored = await storageGet(REFERENCE_PICKER_KEY);
+    const storedPicker = stored[REFERENCE_PICKER_KEY];
+    if (!nextPicker.tabId && storedPicker?.id === nextPicker.id && storedPicker.tabId) {
+      nextPicker.tabId = storedPicker.tabId;
+    }
+
+    state.referencePicker = nextPicker;
+    await storageSet({ [REFERENCE_PICKER_KEY]: nextPicker });
+  }
+
+  async function clearReferencePicker() {
+    state.referencePicker = null;
+    await storageRemove(REFERENCE_PICKER_KEY);
+    await notifyReferencePickerEnded().catch(() => {});
+    hideHoverRing();
+    renderReferencePicker();
+    renderToolbar();
+  }
+
+  function normalizeReferencePicker(value) {
+    if (!value || typeof value !== "object" || !value.id || !value.originPageKey) {
+      return null;
+    }
+
+    return {
+      ...value,
+      draft: value.draft && typeof value.draft === "object" ? stripRemovedAnnotationFields(value.draft) : {},
+      captureArmed: Boolean(value.captureArmed)
+    };
+  }
+
+  function notifyReferencePickerStarted() {
+    return sendRuntimeMessage({ type: "annotator:reference-picker-started" });
+  }
+
+  function notifyReferencePickerEnded() {
+    return sendRuntimeMessage({ type: "annotator:reference-picker-ended" });
   }
 
   function renderMarkers() {
@@ -569,10 +1005,8 @@
       marker.type = "button";
       marker.className = "local-annotator-marker";
       marker.textContent = String(index + 1);
-      marker.dataset.comment = annotation.comment || "Annotation";
-      marker.title = `${annotation.elementSummary}\n${annotation.comment}`;
-      marker.style.left = `${annotation.marker.x}px`;
-      marker.style.top = `${annotation.marker.y}px`;
+      marker.dataset.comment = annotationIntent(annotation) || "Annotation";
+      marker.title = `${annotation.elementSummary}\n${annotationIntent(annotation)}`;
 
       marker.addEventListener("click", (event) => {
         event.preventDefault();
@@ -591,8 +1025,168 @@
         toast("Annotation deleted.");
       });
 
-      document.documentElement.appendChild(marker);
+      const target = safeQuery(annotation.elementPath) || safeQuery(annotation.fullPath);
+      placeMarker(marker, annotation, target);
+      appendAnnotatorNode(marker, annotatorHostForElement(target));
     });
+  }
+
+  function placeMarker(marker, annotation, target) {
+    const host = topLayerHostForElement(target);
+    if (!host) {
+      marker.style.left = `${annotation.marker.x}px`;
+      marker.style.top = `${annotation.marker.y}px`;
+      return;
+    }
+
+    const rect = target.getBoundingClientRect();
+    marker.style.position = "fixed";
+    marker.style.left = `${Math.max(0, rect.left + Math.min(rect.width - 14, 10))}px`;
+    marker.style.top = `${Math.max(0, rect.top + Math.min(rect.height - 14, 10))}px`;
+  }
+
+  function onToolbarPointerDown(event) {
+    const handle = event.target instanceof Element ? event.target.closest("[data-toolbar-drag]") : null;
+    if (!handle || !dom.toolbar?.contains(handle)) {
+      return;
+    }
+
+    const rect = dom.toolbar.getBoundingClientRect();
+    toolbarDrag = {
+      pointerId: event.pointerId,
+      captureTarget: handle,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top
+    };
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    captureToolbarPointer(handle, event.pointerId);
+    dom.toolbar.classList.add("is-dragging");
+    document.addEventListener("pointermove", onToolbarPointerMove, true);
+    document.addEventListener("pointerup", onToolbarPointerUp, true);
+    document.addEventListener("pointercancel", onToolbarPointerCancel, true);
+  }
+
+  function onToolbarPointerMove(event) {
+    if (!toolbarDrag || event.pointerId !== toolbarDrag.pointerId || !dom.toolbar) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+
+    const rect = dom.toolbar.getBoundingClientRect();
+    state.toolbarPosition = clampToolbarPosition({
+      x: event.clientX - toolbarDrag.offsetX,
+      y: event.clientY - toolbarDrag.offsetY
+    }, rect.width, rect.height);
+    applyToolbarPosition();
+    placeClearConfirm();
+  }
+
+  function onToolbarPointerUp(event) {
+    if (!toolbarDrag || event.pointerId !== toolbarDrag.pointerId) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+    finishToolbarDrag(true);
+  }
+
+  function onToolbarPointerCancel(event) {
+    if (!toolbarDrag || event.pointerId !== toolbarDrag.pointerId) {
+      return;
+    }
+
+    finishToolbarDrag(false);
+  }
+
+  function finishToolbarDrag(shouldSave) {
+    const drag = toolbarDrag;
+    toolbarDrag = null;
+    releaseToolbarPointer(drag);
+    dom.toolbar?.classList.remove("is-dragging");
+    document.removeEventListener("pointermove", onToolbarPointerMove, true);
+    document.removeEventListener("pointerup", onToolbarPointerUp, true);
+    document.removeEventListener("pointercancel", onToolbarPointerCancel, true);
+
+    if (shouldSave) {
+      saveSettings();
+    }
+  }
+
+  function captureToolbarPointer(handle, pointerId) {
+    try {
+      handle.setPointerCapture?.(pointerId);
+    } catch (_error) {
+      // Pointer capture is best effort; document listeners still handle standard drags.
+    }
+  }
+
+  function releaseToolbarPointer(drag) {
+    try {
+      if (drag?.captureTarget?.hasPointerCapture?.(drag.pointerId)) {
+        drag.captureTarget.releasePointerCapture(drag.pointerId);
+      }
+    } catch (_error) {
+      // The browser may release capture automatically before pointerup.
+    }
+  }
+
+  function placeToolbar() {
+    if (!dom.toolbar) {
+      return;
+    }
+
+    if (!state.toolbarPosition) {
+      Object.assign(dom.toolbar.style, {
+        left: "",
+        top: "",
+        right: "",
+        bottom: ""
+      });
+      placeClearConfirm();
+      return;
+    }
+
+    const rect = dom.toolbar.getBoundingClientRect();
+    state.toolbarPosition = clampToolbarPosition(state.toolbarPosition, rect.width, rect.height);
+    applyToolbarPosition();
+    placeClearConfirm();
+  }
+
+  function applyToolbarPosition() {
+    if (!dom.toolbar || !state.toolbarPosition) {
+      return;
+    }
+
+    Object.assign(dom.toolbar.style, {
+      left: `${state.toolbarPosition.x}px`,
+      top: `${state.toolbarPosition.y}px`,
+      right: "auto",
+      bottom: "auto"
+    });
+  }
+
+  function clampToolbarPosition(position, width, height) {
+    const margin = 8;
+    const x = Number(position?.x);
+    const y = Number(position?.y);
+    const nextX = Number.isFinite(x) ? x : margin;
+    const nextY = Number.isFinite(y) ? y : margin;
+    const maxX = Math.max(margin, window.innerWidth - Math.max(1, width) - margin);
+    const maxY = Math.max(margin, window.innerHeight - Math.max(1, height) - margin);
+
+    return {
+      x: round(clamp(nextX, margin, maxX), 1),
+      y: round(clamp(nextY, margin, maxY), 1)
+    };
   }
 
   function renderToolbar() {
@@ -606,6 +1200,7 @@
       dom.toolbar = document.createElement("div");
       dom.toolbar.className = "local-annotator-toolbar";
       dom.toolbar.innerHTML = `
+        <button type="button" class="local-annotator-toolbar-grip" data-toolbar-drag="true" aria-label="Move toolbar" data-tooltip="Move"><i aria-hidden="true"></i></button>
         <button type="button" data-action="feedback" aria-label="Toggle feedback mode" data-tooltip="Annotate">${lucideIcon("crosshair")}</button>
         <button type="button" data-action="markers" aria-label="Show or hide markers" data-tooltip="Markers">${lucideIcon("eye")}</button>
         <button type="button" data-action="pause" aria-label="Pause animations and media" data-tooltip="Pause motion">${lucideIcon("pause")}</button>
@@ -614,8 +1209,8 @@
         <button type="button" data-action="close" aria-label="Close annotator toolbar" data-tooltip="Close">${lucideIcon("x")}</button>
         <span data-count>0</span>
       `;
-      document.documentElement.appendChild(dom.toolbar);
 
+      dom.toolbar.addEventListener("pointerdown", onToolbarPointerDown, true);
       dom.toolbar.addEventListener("click", async (event) => {
         const button = event.target.closest("button[data-action]");
         if (!button) {
@@ -625,12 +1220,23 @@
         event.preventDefault();
         event.stopPropagation();
 
+        if (button.dataset.action !== "clear") {
+          closeClearConfirm();
+        }
+
         if (button.dataset.action === "close") {
           closeToolbar();
           return;
         }
 
         if (button.dataset.action === "feedback") {
+          if (state.referencePicker) {
+            state.feedbackEnabled = false;
+            toast("Reference picker active. Use Capture to select the reference.");
+            renderToolbar();
+            return;
+          }
+
           state.toolbarVisible = true;
           state.feedbackEnabled = !state.feedbackEnabled;
           closeComposer();
@@ -655,16 +1261,15 @@
         }
 
         if (button.dataset.action === "clear") {
-          clearPageFeedback();
-          await saveAnnotations();
-          renderMarkers();
-          closeComposer();
-          toast("Cleared annotations for this page.");
+          showClearConfirm();
+          return;
         }
 
         renderToolbar();
       });
     }
+    appendAnnotatorNode(dom.toolbar, activeAnnotatorHost());
+    placeToolbar();
 
     const feedback = dom.toolbar.querySelector('[data-action="feedback"]');
     const markers = dom.toolbar.querySelector('[data-action="markers"]');
@@ -677,6 +1282,142 @@
     count.textContent = String(state.annotations.length);
   }
 
+  function showClearConfirm() {
+    if (!state.annotations.length) {
+      closeClearConfirm();
+      toast("No annotations to clear.");
+      return;
+    }
+
+    if (!dom.clearConfirm) {
+      dom.clearConfirm = document.createElement("div");
+      dom.clearConfirm.className = "local-annotator-clear-confirm";
+      dom.clearConfirm.innerHTML = `
+        <strong>Clear?</strong>
+        <button type="button" data-clear-confirm="yes">Yes</button>
+        <button type="button" data-clear-confirm="no">No</button>
+      `;
+      dom.clearConfirm.addEventListener("click", async (event) => {
+        const button = event.target.closest("button[data-clear-confirm]");
+        if (!button) {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (button.dataset.clearConfirm === "no") {
+          closeClearConfirm();
+          return;
+        }
+
+        closeClearConfirm();
+        await clearAnnotationsFromToolbar();
+      });
+    }
+    appendAnnotatorNode(dom.clearConfirm, activeAnnotatorHost());
+    placeClearConfirm();
+  }
+
+  function closeClearConfirm() {
+    dom.clearConfirm?.remove();
+    dom.clearConfirm = null;
+  }
+
+  function placeClearConfirm() {
+    if (!dom.clearConfirm || !dom.toolbar) {
+      return;
+    }
+
+    const gap = 8;
+    const margin = 8;
+    const toolbarRect = dom.toolbar.getBoundingClientRect();
+    const confirmRect = dom.clearConfirm.getBoundingClientRect();
+    const width = Math.max(1, confirmRect.width);
+    const height = Math.max(1, confirmRect.height);
+    const centerX = toolbarRect.left + toolbarRect.width / 2;
+    const left = clamp(centerX - width / 2, margin, window.innerWidth - width - margin);
+    const above = toolbarRect.top - height - gap;
+    const below = toolbarRect.bottom + gap;
+    const top = above >= margin
+      ? above
+      : clamp(below, margin, window.innerHeight - height - margin);
+
+    Object.assign(dom.clearConfirm.style, {
+      left: `${round(left, 1)}px`,
+      top: `${round(top, 1)}px`,
+      right: "auto",
+      bottom: "auto"
+    });
+  }
+
+  async function clearAnnotationsFromToolbar() {
+    clearPageFeedback();
+    await saveAnnotations();
+    renderMarkers();
+    closeComposer();
+    renderToolbar();
+    toast("Cleared annotations for this page.");
+  }
+
+  function renderReferencePicker() {
+    const picker = state.referencePicker;
+    if (!picker) {
+      dom.referencePicker?.remove();
+      dom.referencePicker = null;
+      return;
+    }
+
+    if (!dom.referencePicker) {
+      dom.referencePicker = document.createElement("div");
+      dom.referencePicker.className = "local-annotator-reference-picker";
+      dom.referencePicker.addEventListener("click", async (event) => {
+        const button = event.target.closest("button[data-reference-action]");
+        if (!button) {
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+
+        if (button.dataset.referenceAction === "capture") {
+          await saveReferencePicker({
+            ...state.referencePicker,
+            captureArmed: !state.referencePicker?.captureArmed
+          });
+          state.feedbackEnabled = false;
+          renderReferencePicker();
+          renderToolbar();
+          syncHoverRing();
+          toast(state.referencePicker.captureArmed ? "Click the reference element." : "Reference capture paused.");
+          return;
+        }
+
+        if (button.dataset.referenceAction === "cancel") {
+          await clearReferencePicker();
+          toast("Reference picker cancelled.");
+        }
+      });
+    }
+    appendAnnotatorNode(dom.referencePicker, activeAnnotatorHost());
+
+    const origin = picker.originTitle || picker.originUrl || "original annotation";
+    const instruction = picker.captureArmed
+      ? "Click the reference element now."
+      : "Navigate normally, then arm capture when the reference is visible.";
+
+    dom.referencePicker.classList.toggle("is-armed", picker.captureArmed);
+    dom.referencePicker.innerHTML = `
+      <div>
+        <strong>${picker.captureArmed ? "Capturing reference" : "Reference picker active"}</strong>
+        <span>${escapeHtml(instruction)}</span>
+        <small>For: ${escapeHtml(origin)}</small>
+      </div>
+      <button type="button" data-reference-action="capture">${picker.captureArmed ? "Pause" : "Capture"}</button>
+      <button type="button" data-reference-action="cancel">Cancel</button>
+    `;
+  }
+
   async function copyFromPage() {
     if (!state.annotations.length) {
       toast("No annotations to copy.");
@@ -685,9 +1426,17 @@
 
     ensureBaseCapture();
     await saveAnnotations();
-    const markdown = formatMarkdown(state.annotations);
-    const copied = await writeClipboard(markdown, state.annotations);
-    toast(copied ? `Copied ${state.annotations.length} annotation${state.annotations.length === 1 ? "" : "s"}.` : "Copy failed. Check clipboard permission and try again.");
+    const markdownExport = buildMarkdownExport(state.annotations);
+    const copied = await writeClipboard(markdownExport.markdown, markdownExport.includedAnnotations);
+    toast(copied ? copiedToast(markdownExport) : "Copy failed. Check clipboard permission and try again.");
+  }
+
+  function copiedToast(markdownExport) {
+    const count = markdownExport.includedAnnotations.length;
+    const omitted = state.dropAppliedAnnotations ? markdownExport.summary.alreadyApplied : 0;
+    const base = `Copied ${count} annotation${count === 1 ? "" : "s"}`;
+
+    return omitted ? `${base} (${omitted} already applied omitted).` : `${base}.`;
   }
 
   function collectElementContext(element, clientX, clientY) {
@@ -698,19 +1447,31 @@
     const fullPath = getFullPath(element);
     const react = detectReact(element);
     const attrs = relevantAttributes(element);
+    const targetMetadata = collectTargetMetadata(element);
     const markerX = Math.round(window.scrollX + rect.left + Math.min(rect.width - 14, 10));
     const markerY = Math.round(window.scrollY + rect.top + Math.min(rect.height - 14, 10));
 
     return {
       id: `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
       comment: "",
+      observation: "",
+      desiredState: "",
+      changeType: "layout",
+      cascade: false,
       scope: "element",
+      referencePattern: "",
       reference: "",
       elementPath: selector,
       robustSelector: selector,
       selectorStrategy: selectorInfo.strategy,
       selectorIsPositional: selectorInfo.positional,
       fullPath,
+      domPath: targetMetadata.domPath,
+      targetFingerprint: targetMetadata.targetFingerprint,
+      targetText: targetMetadata.targetText,
+      snippet: targetMetadata.snippet,
+      matchSignature: targetMetadata.matchSignature,
+      matchedSet: null,
       timestamp: Date.now(),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -747,6 +1508,7 @@
         scrollY: round(window.scrollY, 1),
         devicePixelRatio: window.devicePixelRatio
       },
+      computedStyle: targetMetadata.computedStyle || computedStyleSummary(styles),
       isFixed: ["fixed", "sticky"].includes(styles.position),
       reactComponents: react.components,
       source: react.source
@@ -758,10 +1520,52 @@
   }
 
   function formatAgentMarkdown(annotations) {
-    if (!annotations.length) {
-      return "";
+    return buildMarkdownExport(annotations).markdown;
+  }
+
+  function annotationObservation(annotation) {
+    return normalizeWhitespace(annotation?.observation || annotation?.comment || "");
+  }
+
+  function annotationDesiredState(annotation) {
+    return normalizeWhitespace(annotation?.desiredState || "");
+  }
+
+  function annotationIntent(annotation) {
+    const observation = annotationObservation(annotation);
+    const desiredState = annotationDesiredState(annotation);
+    if (observation && desiredState) {
+      return composeIntent(observation, desiredState);
     }
 
+    return normalizeWhitespace(annotation?.comment || observation || desiredState || "");
+  }
+
+  function composeIntent(observation, desiredState) {
+    const parts = [];
+    if (observation) {
+      parts.push(`Observation: ${observation}`);
+    }
+    if (desiredState) {
+      parts.push(`Desired state: ${desiredState}`);
+    }
+    return parts.join(" ");
+  }
+
+  function buildMarkdownExport(annotations) {
+    if (!annotations.length) {
+      return {
+        markdown: "",
+        includedAnnotations: [],
+        summary: emptyStatusSummary()
+      };
+    }
+
+    const prepared = prepareAnnotationExports(annotations);
+    const included = state.dropAppliedAnnotations
+      ? prepared.items.filter((item) => item.status.kind !== "already-applied")
+      : prepared.items;
+    const includedAnnotations = included.map((item) => item.annotation);
     const title = document.title || "Untitled page";
     const url = location.href;
     const baseHash = state.baseHash || domSnapshotHash();
@@ -773,25 +1577,54 @@
     ];
 
     lines.push(agentLine("source", url));
-    lines.push(agentLine("apply", `all ${annotations.length} annotation${annotations.length === 1 ? "" : "s"} in this batch`));
+    lines.push(agentLine("apply", `all ${included.length} annotation${included.length === 1 ? "" : "s"} in this batch`));
     lines.push(agentLine("base", `${baseHash} (captured ${baseCapturedAt})`));
     lines.push("# base = hash of the DOM these notes were taken against; if it no longer matches, some items may already be applied.");
+    lines.push(agentLine("fresh", `${prepared.summary.fresh} · already-applied: ${prepared.summary.alreadyApplied} · review: ${prepared.summary.review}`));
 
-    const attachments = formatAttachments(annotations);
+    const attachments = includedAnnotations.length ? formatAttachments(includedAnnotations) : "";
     if (attachments) {
       lines.push(agentLine("attachments", attachments));
     }
 
     lines.push("");
 
-    annotations.forEach((annotation, index) => {
+    included.forEach((item, index) => {
+      const { annotation } = item;
+      const intent = annotationIntent(annotation);
+      const observation = annotationObservation(annotation);
+      const desiredState = annotationDesiredState(annotation);
       lines.push(`### ${index + 1}  ·  id: ${annotation.id}`);
-      lines.push(agentLine("intent", annotation.comment || ""));
-      lines.push(agentLine("target", `${annotation.humanLocator || humanLocatorFromAnnotation(annotation)}   ·   anchor: ${anchorForAnnotation(annotation)}`));
+      lines.push(agentLine("intent", intent));
+      if (observation) {
+        lines.push(agentLine("observation", observation));
+      }
+      if (desiredState) {
+        lines.push(agentLine("desiredState", desiredState));
+      }
+      lines.push(agentLine("changeType", normalizeChangeType(annotation.changeType, intent)));
+      lines.push(agentLine("cascade", formatCascade(annotation.cascade)));
+      lines.push(agentLine("status", item.status.text));
+      lines.push(agentLine("target", `${annotation.humanLocator || humanLocatorFromAnnotation(annotation)}   ·   anchor: ${anchorForAnnotation(annotation, item.target)}`));
 
-      const text = truncate(annotation.selectedText || annotation.nearbyText || "", 80);
+      const domPath = formatDomPath(item.domPath || annotation.domPath);
+      if (domPath) {
+        lines.push(agentLine("domPath", domPath));
+      }
+
+      const targetHash = item.targetFingerprint || annotation.targetFingerprint;
+      if (targetHash) {
+        lines.push(agentLine("targetHash", targetHash));
+      }
+
+      const text = truncate(item.currentText || annotation.targetText || annotation.selectedText || annotation.nearbyText || "", 80);
       if (text) {
         lines.push(agentLine("text", text));
+      }
+
+      const snippet = item.snippet || annotation.snippet || "";
+      if (snippet) {
+        lines.push(agentLine("snippet", snippet));
       }
 
       const roleAria = annotation.roleAria || roleAriaFromAccessibility(annotation.accessibility);
@@ -801,16 +1634,72 @@
 
       lines.push(agentLine("scope", normalizeScope(annotation.scope)));
 
-      if (annotation.reference) {
-        lines.push(agentLine("reference", annotation.reference));
+      if (item.matches) {
+        lines.push(agentLine("matches", item.matches));
       }
-      lines.push(agentLine("shot", shotNote(annotation)));
+
+      const box = formatBoundingBox(item.boundingBox || annotation.boundingBox);
+      if (box) {
+        lines.push(agentLine("boundingBox", box));
+      }
+
+      const computedStyle = formatComputedStyle(item.computedStyle || annotation.computedStyle);
+      if (computedStyle) {
+        lines.push(agentLine("computedStyle", computedStyle));
+      }
+
+      const reference = formatReference(annotation);
+      if (reference) {
+        lines.push(agentLine("reference", reference));
+      }
+      lines.push(agentLine("shot", shotExportValue(annotation)));
       lines.push("");
     });
 
-    lines.push("Implementation note: use the fields above as implementation context. Do not skip annotations because their screenshot is missing; the shot field only describes attachment availability.");
+    lines.push("Implementation note: use the fields above as implementation context. Do not skip annotations because their screenshot is missing; the shot field includes a dataUrl when an image crop is available and an explicit failure note when it is not.");
 
-    return lines.join("\n").trim() + "\n";
+    return {
+      markdown: lines.join("\n").trim() + "\n",
+      includedAnnotations,
+      summary: prepared.summary
+    };
+  }
+
+  function prepareAnnotationExports(annotations) {
+    const summary = emptyStatusSummary();
+    const items = annotations.map((annotation) => {
+      const target = resolveAnnotationTarget(annotation).element;
+      const status = statusForAnnotation(annotation, target);
+      const currentText = target ? visibleElementText(target) : "";
+      const scope = normalizeScope(annotation.scope);
+      const targetMetadata = target ? collectTargetMetadata(target, scope, annotation.matchSignature) : null;
+      const snippet = targetMetadata?.snippet || annotation.snippet || "";
+
+      summary[status.summaryKey] += 1;
+
+      return {
+        annotation,
+        target,
+        status,
+        currentText,
+        snippet,
+        domPath: targetMetadata?.domPath || annotation.domPath || null,
+        targetFingerprint: targetMetadata?.targetFingerprint || annotation.targetFingerprint || "",
+        boundingBox: targetMetadata?.boundingBox || annotation.boundingBox || null,
+        computedStyle: targetMetadata?.computedStyle || annotation.computedStyle || null,
+        matches: scope === "element" ? "" : matchesLineForAnnotation(annotation, target, scope)
+      };
+    });
+
+    return { items, summary };
+  }
+
+  function emptyStatusSummary() {
+    return {
+      fresh: 0,
+      alreadyApplied: 0,
+      review: 0
+    };
   }
 
   function agentLine(label, value) {
@@ -861,10 +1750,149 @@
     return "screenshot unavailable; no image crop captured";
   }
 
-  function anchorForAnnotation(annotation) {
-    const selector = annotation.robustSelector || annotation.elementPath || "";
-    const positional = annotation.selectorIsPositional || annotation.selectorStrategy === "positional" || selector.includes(":nth-of-type");
+  function shotExportValue(annotation) {
+    const note = shotNote(annotation);
+    if (annotation.shot?.dataUrl) {
+      return `${note}; dataUrl: ${annotation.shot.dataUrl}`;
+    }
+
+    return note;
+  }
+
+  function formatReference(annotation) {
+    const pattern = normalizeWhitespace(annotation.referencePattern || "");
+    const exampleLocation = normalizeWhitespace(annotation.reference || "");
+    if (!pattern && !exampleLocation) {
+      return "";
+    }
+
+    if (pattern && exampleLocation) {
+      return `pattern: ${pattern}; exampleLocation: ${exampleLocation}`;
+    }
+
+    return pattern ? `pattern: ${pattern}` : `exampleLocation: ${exampleLocation}`;
+  }
+
+  function formatCascade(value) {
+    if (typeof value === "string") {
+      const text = normalizeWhitespace(value);
+      return text || "false";
+    }
+
+    return value ? "true" : "false";
+  }
+
+  function formatBoundingBox(box) {
+    if (!box || typeof box !== "object") {
+      return "";
+    }
+
+    return `page x=${box.x}, y=${box.y}, w=${box.width}, h=${box.height}; viewport x=${box.viewportX}, y=${box.viewportY}`;
+  }
+
+  function formatComputedStyle(styles) {
+    if (!styles || typeof styles !== "object") {
+      return "";
+    }
+
+    return Object.entries(styles)
+      .map(([key, value]) => `${key}=${value}`)
+      .join("; ");
+  }
+
+  function anchorForAnnotation(annotation, target = null) {
+    const selectorInfo = target ? getRobustSelectorInfo(target) : null;
+    const selector = selectorInfo?.selector || annotation.robustSelector || annotation.elementPath || "";
+    const positional = selectorInfo
+      ? selectorInfo.positional
+      : annotation.selectorIsPositional || annotation.selectorStrategy === "positional" || selector.includes(":nth-of-type");
     return positional ? `${selector} (positional — may drift)` : selector;
+  }
+
+  function resolveAnnotationTarget(annotation) {
+    const selectors = uniqueStrings([annotation.robustSelector, annotation.elementPath, annotation.fullPath]);
+
+    for (const selector of selectors) {
+      const element = safeQuery(selector);
+      if (element && !isAnnotatorElement(element)) {
+        return { element, selector };
+      }
+    }
+
+    const domPathElement = elementFromDomPath(annotation.domPath);
+    if (domPathElement && !isAnnotatorElement(domPathElement)) {
+      return { element: domPathElement, selector: formatDomPath(annotation.domPath) };
+    }
+
+    const fingerprintElement = elementByFingerprint(annotation.targetFingerprint);
+    if (fingerprintElement && !isAnnotatorElement(fingerprintElement)) {
+      return { element: fingerprintElement, selector: `targetHash:${annotation.targetFingerprint}` };
+    }
+
+    return { element: null, selector: "" };
+  }
+
+  function statusForAnnotation(annotation, target) {
+    if (!target) {
+      return statusValue("review", "review (target not found)");
+    }
+
+    const requestedCopy = requestedCopyText(annotationIntent(annotation));
+    if (requestedCopy && sameNormalizedText(visibleElementText(target), requestedCopy)) {
+      return statusValue("alreadyApplied", "already-applied");
+    }
+
+    if (annotation.targetFingerprint && elementFingerprint(target) !== annotation.targetFingerprint) {
+      return statusValue("review", "review (target changed since capture)");
+    }
+
+    return statusValue("fresh", "fresh");
+  }
+
+  function statusValue(summaryKey, text) {
+    return {
+      kind: summaryKey === "alreadyApplied" ? "already-applied" : summaryKey,
+      summaryKey,
+      text
+    };
+  }
+
+  function requestedCopyText(intent) {
+    const text = String(intent || "");
+    const quoted = quotedStrings(text);
+    if (!quoted.length) {
+      return "";
+    }
+
+    const explicitCopyChange = /\b(change|update|replace|set|make|rename|retitle)\b[\s\S]{0,180}\b(to|with|say|read)\s*["'“‘]/i.test(text);
+    if (explicitCopyChange) {
+      return quoted[quoted.length - 1];
+    }
+
+    const copyLike = /\b(copy|text|label|headline|title|wording|caption|content|cta|button)\b/i.test(text);
+    const destructiveOnly = /\b(remove|delete|hide)\b/i.test(text) && !/\b(to|with|say|read)\b/i.test(text);
+    if (copyLike && !destructiveOnly) {
+      return quoted[quoted.length - 1];
+    }
+
+    return "";
+  }
+
+  function quotedStrings(text) {
+    const matches = [];
+    const pattern = /"([^"]+)"|'([^']+)'|“([^”]+)”|‘([^’]+)’/g;
+    let match = pattern.exec(text);
+
+    while (match) {
+      matches.push(match[1] || match[2] || match[3] || match[4] || "");
+      match = pattern.exec(text);
+    }
+
+    return matches.map(normalizeWhitespace).filter(Boolean);
+  }
+
+  function sameNormalizedText(left, right) {
+    return normalizeWhitespace(left) === normalizeWhitespace(right);
   }
 
   function roleAriaFromAccessibility(accessibility) {
@@ -896,7 +1924,7 @@
 
   function domSnapshotHash() {
     const clone = document.documentElement.cloneNode(true);
-    clone.querySelectorAll(".local-annotator-hover-ring, .local-annotator-target-ring, .local-annotator-marker, .local-annotator-composer, .local-annotator-toast, .local-annotator-toolbar").forEach((node) => node.remove());
+    clone.querySelectorAll(ANNOTATOR_ELEMENT_SELECTOR).forEach((node) => node.remove());
     return djb2Hash(clone.outerHTML);
   }
 
@@ -909,6 +1937,322 @@
     }
 
     return hash.toString(16).padStart(8, "0").slice(0, 12);
+  }
+
+  function targetElementForMetadata(existingAnnotation, element) {
+    if (!existingAnnotation) {
+      return element instanceof Element ? element : null;
+    }
+
+    const resolved = resolveAnnotationTarget(existingAnnotation).element;
+    if (resolved) {
+      return resolved;
+    }
+
+    return element instanceof Element && element !== document.body && element !== document.documentElement ? element : null;
+  }
+
+  function collectTargetMetadata(element, scope = "element", preferredSignature = "") {
+    const matchSignature = preferredSignature || primaryMatchSignature(element);
+    const styles = window.getComputedStyle(element);
+
+    return {
+      targetFingerprint: elementFingerprint(element),
+      targetText: visibleElementText(element),
+      snippet: outerHtmlSnippet(element),
+      domPath: structuralDomPath(element),
+      boundingBox: boundingBoxForElement(element),
+      computedStyle: computedStyleSummary(styles),
+      matchSignature,
+      matchedSet: normalizeScope(scope) === "element" ? null : collectMatchedSet(element, scope, matchSignature)
+    };
+  }
+
+  function elementFingerprint(element) {
+    return djb2Hash(normalizedOuterHtml(element));
+  }
+
+  function outerHtmlSnippet(element) {
+    return normalizedOuterHtml(element);
+  }
+
+  function normalizedOuterHtml(element) {
+    return normalizeWhitespace(element?.outerHTML || "");
+  }
+
+  function boundingBoxForElement(element) {
+    const rect = element.getBoundingClientRect();
+    return {
+      x: round(window.scrollX + rect.left, 1),
+      y: round(window.scrollY + rect.top, 1),
+      width: round(rect.width, 1),
+      height: round(rect.height, 1),
+      viewportX: round(rect.left, 1),
+      viewportY: round(rect.top, 1)
+    };
+  }
+
+  function computedStyleSummary(styles) {
+    if (!styles) {
+      return null;
+    }
+
+    return compactObject({
+      position: styles.position,
+      display: styles.display,
+      color: styles.color,
+      backgroundColor: styles.backgroundColor,
+      fontSize: styles.fontSize,
+      fontWeight: styles.fontWeight,
+      lineHeight: styles.lineHeight,
+      margin: boxStyle(styles, "margin"),
+      padding: boxStyle(styles, "padding"),
+      border: styles.border,
+      borderRadius: styles.borderRadius,
+      gap: styles.gap,
+      alignItems: styles.alignItems,
+      justifyContent: styles.justifyContent,
+      zIndex: styles.zIndex,
+      overflow: `${styles.overflowX}/${styles.overflowY}`,
+      opacity: styles.opacity,
+      transform: styles.transform
+    });
+  }
+
+  function boxStyle(styles, prefix) {
+    const values = ["Top", "Right", "Bottom", "Left"].map((side) => styles[`${prefix}${side}`]);
+    return values.every((value) => value === values[0]) ? values[0] : values.join(" ");
+  }
+
+  function compactObject(value) {
+    return Object.fromEntries(
+      Object.entries(value || {}).filter(([_key, item]) => {
+        const text = String(item ?? "").trim();
+        return text && text !== "none" && text !== "normal" && text !== "auto" && text !== "0px" && text !== "0px 0px 0px 0px";
+      })
+    );
+  }
+
+  function structuralDomPath(element) {
+    if (!(element instanceof Element)) {
+      return null;
+    }
+
+    const indices = [];
+    let cursor = element;
+
+    while (cursor && cursor !== document.documentElement) {
+      if (cursor.id) {
+        break;
+      }
+
+      const parent = cursor.parentElement;
+      if (!parent) {
+        break;
+      }
+
+      indices.unshift(Array.from(parent.children).indexOf(cursor));
+      cursor = parent;
+    }
+
+    const anchorElement = cursor instanceof Element ? cursor : document.documentElement;
+    const anchor = anchorElement === document.documentElement
+      ? "html"
+      : `${anchorElement.tagName.toLowerCase()}#${cssEscape(anchorElement.id)}`;
+
+    return {
+      anchor,
+      indices,
+      value: formatDomPath({ anchor, indices })
+    };
+  }
+
+  function normalizeDomPathValue(value) {
+    if (!value) {
+      return null;
+    }
+
+    if (typeof value === "string") {
+      const [anchor, indicesText = ""] = value.split(">");
+      const indices = indicesText
+        .split(".")
+        .map((item) => Number(item))
+        .filter((item) => Number.isInteger(item) && item >= 0);
+      return anchor.trim() ? { anchor: anchor.trim(), indices } : null;
+    }
+
+    if (typeof value !== "object") {
+      return null;
+    }
+
+    if (!value.anchor && value.value) {
+      return normalizeDomPathValue(value.value);
+    }
+
+    const anchor = String(value.anchor || "").trim();
+    if (!anchor) {
+      return null;
+    }
+
+    const indices = Array.isArray(value.indices)
+      ? value.indices.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item >= 0)
+      : [];
+
+    return { anchor, indices };
+  }
+
+  function formatDomPath(value) {
+    const path = normalizeDomPathValue(value);
+    if (!path) {
+      return "";
+    }
+
+    return path.indices.length ? `${path.anchor} > ${path.indices.join(".")}` : path.anchor;
+  }
+
+  function elementFromDomPath(value) {
+    const path = normalizeDomPathValue(value);
+    if (!path) {
+      return null;
+    }
+
+    let cursor = path.anchor === "html" ? document.documentElement : safeQuery(path.anchor);
+    for (const index of path.indices) {
+      cursor = cursor?.children?.[index] || null;
+      if (!cursor) {
+        return null;
+      }
+    }
+
+    return cursor instanceof Element ? cursor : null;
+  }
+
+  function elementByFingerprint(fingerprint) {
+    const targetHash = String(fingerprint || "").trim();
+    if (!targetHash) {
+      return null;
+    }
+
+    return Array.from(document.querySelectorAll("body *")).find((element) => {
+      return !isAnnotatorElement(element) && elementFingerprint(element) === targetHash;
+    }) || null;
+  }
+
+  function visibleElementText(element) {
+    if (!(element instanceof Element)) {
+      return "";
+    }
+
+    if (element.tagName === "SELECT") {
+      return normalizeWhitespace(Array.from(element.selectedOptions || []).map((option) => option.textContent || "").join(" "));
+    }
+
+    if (["INPUT", "TEXTAREA"].includes(element.tagName)) {
+      return normalizeWhitespace(element.value || element.getAttribute("value") || element.getAttribute("placeholder") || "");
+    }
+
+    return normalizeWhitespace(
+      element.innerText ||
+        element.textContent ||
+        element.getAttribute("aria-label") ||
+        element.getAttribute("alt") ||
+        element.getAttribute("title") ||
+        ""
+    );
+  }
+
+  function matchesLineForAnnotation(annotation, target, scope) {
+    const set = target ? collectMatchedSet(target, scope, annotation.matchSignature) : annotation.matchedSet;
+    if (!set && !target) {
+      return "target not found; matched set unavailable";
+    }
+
+    return formatMatchedSet(set);
+  }
+
+  function collectMatchedSet(element, scope = "component", preferredSignature = "") {
+    const signature = preferredSignature || primaryMatchSignature(element);
+    const matches = signature
+      ? uniqueElements([element, ...safeQueryAll(signature)].filter((item) => item && !isAnnotatorElement(item)))
+      : [element];
+
+    return {
+      scope: normalizeScope(scope),
+      signature,
+      count: matches.length,
+      items: matches.map((match) => {
+        const selectorInfo = getRobustSelectorInfo(match);
+        return {
+          anchor: selectorInfo.positional ? `${selectorInfo.selector} (positional — may drift)` : selectorInfo.selector,
+          locator: humanLocator(match)
+        };
+      })
+    };
+  }
+
+  function formatMatchedSet(set) {
+    if (!set) {
+      return "";
+    }
+
+    if (!set.count) {
+      return "0 elements";
+    }
+
+    if (set.count === 1) {
+      return "1 element (this element only)";
+    }
+
+    const anchors = set.items
+      .map((item) => `${item.anchor}${item.locator ? ` (${item.locator})` : ""}`)
+      .join("; ");
+
+    return `${set.count} elements — anchors: ${anchors}`;
+  }
+
+  function primaryMatchSignature(element) {
+    if (!(element instanceof Element)) {
+      return "";
+    }
+
+    const className = semanticClassName(element) || firstReusableClassName(element);
+    if (className) {
+      return `.${cssEscape(className)}`;
+    }
+
+    const stableAttr = stableDataAttribute(element);
+    if (stableAttr) {
+      return dataAttributeSelector(element.tagName.toLowerCase(), stableAttr);
+    }
+
+    const role = element.getAttribute("role");
+    if (role) {
+      return `${element.tagName.toLowerCase()}[role="${cssString(role)}"]`;
+    }
+
+    return "";
+  }
+
+  function firstReusableClassName(element) {
+    return Array.from(element.classList || []).find((name) => {
+      return name && !name.startsWith("local-annotator") && /^[a-zA-Z_-][a-zA-Z0-9_-]*$/.test(name) && !/^[a-f0-9]{8,}$/i.test(name);
+    }) || "";
+  }
+
+  function safeQueryAll(selector) {
+    try {
+      return selector ? Array.from(document.querySelectorAll(selector)) : [];
+    } catch (_error) {
+      return [];
+    }
+  }
+
+  function uniqueElements(elements) {
+    return Array.from(new Set(elements));
+  }
+
+  function uniqueStrings(values) {
+    return Array.from(new Set(values.map((value) => String(value || "").trim()).filter(Boolean)));
   }
 
   async function captureElementShot(annotation) {
@@ -926,7 +2270,7 @@
         const dataUrl = await requestVisibleTabImage();
         const image = await loadImage(dataUrl);
         const shot = await cropImageToShot(image, visibleRect);
-        return shot || { note: "screenshot skipped; crop exceeded size cap" };
+        return shot || { note: "screenshot skipped (still over cap after downscale)" };
       });
     } catch (_error) {
       return { note: "screenshot unavailable; capture permission failed" };
@@ -947,7 +2291,7 @@
   }
 
   async function withHiddenAnnotatorOverlays(callback) {
-    const nodes = Array.from(document.querySelectorAll(".local-annotator-hover-ring, .local-annotator-target-ring, .local-annotator-marker, .local-annotator-composer, .local-annotator-toast, .local-annotator-toolbar"));
+    const nodes = Array.from(document.querySelectorAll(ANNOTATOR_ELEMENT_SELECTOR));
     const previous = nodes.map((node) => [node, node.style.visibility]);
 
     nodes.forEach((node) => {
@@ -999,13 +2343,13 @@
 
   async function cropImageToShot(image, crop) {
     const dpr = window.devicePixelRatio || 1;
-    let width = Math.min(SHOT_MAX_WIDTH, Math.round(crop.width));
-    let height = Math.max(1, Math.round((crop.height / Math.max(1, crop.width)) * width));
+    const maxBytes = effectiveShotMaxBytes();
+    let { width, height } = scaledCropSize(crop, SHOT_MAX_LONG_EDGE);
 
-    while (width >= 80) {
-      const dataUrl = renderCrop(image, crop, dpr, width, height);
+    while (true) {
+      const dataUrl = renderCrop(image, crop, dpr, width, height, "image/jpeg", SHOT_JPEG_QUALITY);
       const bytes = dataUrlBytes(dataUrl);
-      if (bytes <= SHOT_MAX_BYTES) {
+      if (bytes <= maxBytes) {
         return {
           note: `attached image crop (${Math.round(bytes / 1024)} KB)`,
           dataUrl,
@@ -1015,6 +2359,10 @@
         };
       }
 
+      if (Math.max(width, height) <= 80) {
+        break;
+      }
+
       width = Math.floor(width * 0.75);
       height = Math.max(1, Math.floor(height * 0.75));
     }
@@ -1022,12 +2370,55 @@
     return null;
   }
 
-  function renderCrop(image, crop, dpr, width, height) {
+  function scaledCropSize(crop, maxLongEdge) {
+    const sourceWidth = Math.max(1, Math.round(crop.width));
+    const sourceHeight = Math.max(1, Math.round(crop.height));
+    const scale = Math.min(1, maxLongEdge / Math.max(sourceWidth, sourceHeight));
+
+    return {
+      width: Math.max(1, Math.round(sourceWidth * scale)),
+      height: Math.max(1, Math.round(sourceHeight * scale))
+    };
+  }
+
+  function effectiveShotMaxBytes() {
+    return normalizeShotMaxBytes(state.shotMaxBytes);
+  }
+
+  function normalizeShotMaxBytes(value) {
+    const bytes = Number(value);
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+      return SHOT_DEFAULT_MAX_BYTES;
+    }
+
+    return Math.max(SHOT_MIN_MAX_BYTES, Math.round(bytes));
+  }
+
+  function normalizeToolbarPosition(value) {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+
+    const x = Number(value.x);
+    const y = Number(value.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return null;
+    }
+
+    return {
+      x: round(x, 1),
+      y: round(y, 1)
+    };
+  }
+
+  function renderCrop(image, crop, dpr, width, height, type = "image/jpeg", quality = SHOT_JPEG_QUALITY) {
     const canvas = document.createElement("canvas");
     canvas.width = width;
     canvas.height = height;
 
     const context = canvas.getContext("2d");
+    context.fillStyle = "#fff";
+    context.fillRect(0, 0, width, height);
     context.drawImage(
       image,
       Math.round(crop.left * dpr),
@@ -1040,7 +2431,7 @@
       height
     );
 
-    return canvas.toDataURL("image/png");
+    return canvas.toDataURL(type, quality);
   }
 
   function dataUrlBytes(dataUrl) {
@@ -1080,6 +2471,7 @@
       hideHoverRing();
       renderMarkers();
       renderToolbar();
+      renderReferencePicker();
     }, 700);
   }
 
@@ -1100,9 +2492,9 @@
       }
     }
 
-    const stableAttr = firstAttribute(element, STABLE_DATA_ATTRIBUTES);
-    if (stableAttr && isHumanToken(stableAttr.value)) {
-      const selector = `${tag}[${stableAttr.name}="${cssString(stableAttr.value)}"]`;
+    const stableAttr = stableDataAttribute(element);
+    if (stableAttr && (stableAttr.value === "" || isHumanToken(stableAttr.value))) {
+      const selector = dataAttributeSelector(tag, stableAttr);
       if (isUnique(selector)) {
         return { selector, strategy: "data", positional: false };
       }
@@ -1219,13 +2611,66 @@
     }
   }
 
-  function elementAt(clientX, clientY) {
-    const element = document.elementFromPoint(clientX, clientY);
+  function elementAt(clientX, clientY, event = null) {
+    const element = eventElementAtPoint(event, clientX, clientY) || underlyingElementFromPoint(clientX, clientY);
     if (!element || isAnnotatorElement(element)) {
       return null;
     }
 
     return element;
+  }
+
+  function underlyingElementFromPoint(clientX, clientY) {
+    const element = document.elementFromPoint(clientX, clientY);
+    if (element && !isAnnotatorElement(element)) {
+      return element;
+    }
+
+    return withTemporarilyHiddenAnnotatorChrome(() => {
+      const target = document.elementFromPoint(clientX, clientY);
+      return target && !isAnnotatorElement(target) ? target : null;
+    });
+  }
+
+  function withTemporarilyHiddenAnnotatorChrome(callback) {
+    const nodes = Array.from(document.querySelectorAll(ANNOTATOR_ELEMENT_SELECTOR));
+    const previous = nodes.map((node) => [node, node.style.visibility]);
+
+    nodes.forEach((node) => {
+      node.style.visibility = "hidden";
+    });
+
+    try {
+      return callback();
+    } finally {
+      previous.forEach(([node, visibility]) => {
+        node.style.visibility = visibility;
+      });
+    }
+  }
+
+  function eventElementAtPoint(event, clientX, clientY) {
+    if (!event || typeof event.composedPath !== "function") {
+      return null;
+    }
+
+    return event.composedPath().find((node) => {
+      return node instanceof Element &&
+        node !== document.documentElement &&
+        node !== document.body &&
+        !isAnnotatorElement(node) &&
+        isPointInsideElement(node, clientX, clientY);
+    }) || null;
+  }
+
+  function isPointInsideElement(element, clientX, clientY) {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 &&
+      rect.height > 0 &&
+      clientX >= rect.left &&
+      clientX <= rect.right &&
+      clientY >= rect.top &&
+      clientY <= rect.bottom;
   }
 
   function elementLabel(element) {
@@ -1625,6 +3070,8 @@
   function composeContextPreview(annotation) {
     const parts = [
       `selector: ${annotation.elementPath}`,
+      `domPath: ${formatDomPath(annotation.domPath)}`,
+      `targetHash: ${annotation.targetFingerprint}`,
       `fullPath: ${annotation.fullPath}`,
       `position: ${annotation.boundingBox.x}, ${annotation.boundingBox.y} (${annotation.boundingBox.width}x${annotation.boundingBox.height})`
     ];
@@ -1646,6 +3093,93 @@
 
   function normalizeScope(value) {
     return ["element", "component", "global"].includes(String(value)) ? String(value) : "element";
+  }
+
+  function changeTypeOptions(selected) {
+    const current = CHANGE_TYPES.includes(String(selected)) ? String(selected) : "";
+    return [
+      option("", "Auto", current),
+      ...CHANGE_TYPES.map((value) => option(value, value, current))
+    ].join("");
+  }
+
+  function normalizeChangeType(value, text = "") {
+    const candidate = String(value || "");
+    return CHANGE_TYPES.includes(candidate) ? candidate : inferChangeType(text);
+  }
+
+  function inferChangeType(text) {
+    const value = normalizeWhitespace(text).toLowerCase();
+    if (/\b(color|colour|background|foreground|contrast|hue|shade|tint|blue|red|green|yellow|black|white|gray|grey)\b/.test(value)) {
+      return "color";
+    }
+
+    if (/\b(copy|text|label|headline|title|wording|caption|content|cta|sentence|paragraph)\b/.test(value)) {
+      return "copy";
+    }
+
+    if (/\b(spacing|padding|margin|gap|space|breathing room|offset)\b/.test(value)) {
+      return "spacing";
+    }
+
+    if (/\b(value|number|amount|price|count|metric|total|date|time|data)\b/.test(value)) {
+      return "data-value";
+    }
+
+    if (/\b(add|remove|delete|hide|show|insert|wrap|unwrap|group|split|reorder|move before|move after|nest|component|structure|hierarchy)\b/.test(value)) {
+      return "structure";
+    }
+
+    return "layout";
+  }
+
+  function atomicityIssueForDesiredState(value) {
+    const raw = String(value || "").trim();
+    const text = normalizeWhitespace(raw);
+    if (!text) {
+      return "";
+    }
+
+    const bulletLines = raw
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => /^(?:[-*]|\d+[.)])\s+\S/.test(line));
+    if (bulletLines.length > 1) {
+      return "Multiple desired states detected. Split them into separate annotations.";
+    }
+
+    const separatedClauses = text
+      .split(/\s*(?:;|\balso\b|\band then\b|\bthen\b)\s*/i)
+      .filter(Boolean)
+      .filter(hasChangeVerb);
+    if (separatedClauses.length > 1) {
+      return "Multiple desired states detected. Split them into separate annotations.";
+    }
+
+    const verbs = text.match(changeVerbPattern()) || [];
+    if (verbs.length > 1 && /\band\b/i.test(text)) {
+      return "Multiple desired states detected. Split them into separate annotations.";
+    }
+
+    return "";
+  }
+
+  function hasChangeVerb(value) {
+    return changeVerbPattern().test(value);
+  }
+
+  function changeVerbPattern() {
+    return /\b(add|align|change|convert|delete|fix|hide|increase|decrease|insert|make|move|remove|rename|replace|resize|reorder|retitle|set|show|split|update|wrap)\b/gi;
+  }
+
+  function showAtomicityWarning(composer, message) {
+    const warning = composer.querySelector("[data-atomicity-warning]");
+    if (!warning) {
+      return;
+    }
+
+    warning.textContent = message;
+    warning.hidden = !message;
   }
 
   function lucideIcon(name) {
@@ -1673,8 +3207,32 @@
     return null;
   }
 
+  function stableDataAttribute(element) {
+    const named = firstAttribute(element, STABLE_DATA_ATTRIBUTES);
+    if (named && isHumanToken(named.value)) {
+      return named;
+    }
+
+    return firstStableDataAttribute(element);
+  }
+
+  function firstStableDataAttribute(element) {
+    return Array.from(element.attributes || []).find((attr) => {
+      if (!attr.name.startsWith("data-") || /^data-(react|next|astro|svelte|vue|v)-/i.test(attr.name)) {
+        return false;
+      }
+
+      const nameToken = attr.name.slice(5);
+      return isHumanToken(nameToken) && (attr.value === "" || isHumanToken(attr.value));
+    }) || null;
+  }
+
+  function dataAttributeSelector(tag, attr) {
+    return attr.value === "" ? `${tag}[${attr.name}]` : `${tag}[${attr.name}="${cssString(attr.value)}"]`;
+  }
+
   function isAnnotatorElement(target) {
-    return target instanceof Element && Boolean(target.closest(".local-annotator-hover-ring, .local-annotator-target-ring, .local-annotator-marker, .local-annotator-composer, .local-annotator-toast, .local-annotator-toolbar"));
+    return target instanceof Element && Boolean(target.closest(ANNOTATOR_CHROME_SELECTOR));
   }
 
   function isTypingTarget(target) {
@@ -1695,6 +3253,24 @@
 
   function storageSet(value) {
     return new Promise((resolve) => chrome.storage.local.set(value, resolve));
+  }
+
+  function storageRemove(keys) {
+    return new Promise((resolve) => chrome.storage.local.remove(keys, resolve));
+  }
+
+  function sendRuntimeMessage(message) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(message, (response) => {
+        const error = chrome.runtime.lastError;
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        resolve(response);
+      });
+    });
   }
 
   async function writeClipboard(text, annotations = []) {
@@ -1751,7 +3327,7 @@
     dom.toast = document.createElement("div");
     dom.toast.className = "local-annotator-toast";
     dom.toast.textContent = message;
-    document.documentElement.appendChild(dom.toast);
+    appendAnnotatorNode(dom.toast, activeAnnotatorHost(hoveredElement));
     window.setTimeout(() => {
       dom.toast?.remove();
       dom.toast = null;
