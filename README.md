@@ -10,7 +10,7 @@ The name is short for "annotator."
 - Uses a custom Anny extension icon in Chrome.
 - Lets the user click a specific UI element and attach feedback to it.
 - Adds numbered annotation markers directly on the page.
-- Copies a lean agent-ready markdown report with a source URL, DOM base hash, robust anchors, structural DOM paths, target hashes, scope, optional structured reference context, style/box context, and cropped screenshot data when available.
+- Copies a lean agent-ready markdown report with a source URL, DOM base hash, robust anchors, human locators, scope, optional reference field, and cropped screenshot notes.
 - Stores annotations locally with `chrome.storage.local`.
 - Runs without a backend, account system, analytics, or network requests.
 
@@ -65,7 +65,7 @@ When the toolbar is closed, Anny does not capture page keyboard shortcuts.
 
 ## Export
 
-Anny exports one agent-ready Markdown prompt. It includes the compatibility `intent`, split `observation` and `desiredState`, change type, cascade flag, human target locator, robust anchor, structural DOM path, target hash, nearby text, full target HTML snippet, role/ARIA when present, scope, reference pattern/example when present, box/style context, and screenshot data or explicit failure notes. Screenshot capture is automatic; when Chrome cannot provide a crop, the export says so explicitly.
+Anny exports one agent-ready Markdown prompt. It includes the verbatim intent, human target locator, robust anchor, nearby text, role/ARIA when present, scope, reference when present, and screenshot notes. Screenshot capture is automatic; when Chrome cannot provide a crop, the export says so explicitly.
 
 ## Limitations
 

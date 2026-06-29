@@ -13,7 +13,7 @@
   const SHOT_DEFAULT_MAX_BYTES = 512 * 1024;
   const SHOT_MIN_MAX_BYTES = 96 * 1024;
   const SHOT_JPEG_QUALITY = 0.6;
-  const CHANGE_TYPES = ["copy", "color", "layout", "spacing", "data-value", "structure"];
+  const SNIPPET_MAX = 300;
   const STABLE_DATA_ATTRIBUTES = [
     "data-testid",
     "data-test",
@@ -523,27 +523,7 @@
     composer.className = "local-annotator-composer";
     composer.innerHTML = `
       <strong title="${escapeAttr(snapshot.elementPath)}">${escapeHtml(snapshot.elementSummary)}</strong>
-      <label>
-        <span>Observation</span>
-        <textarea name="observation" placeholder="What is wrong?" required>${escapeHtml(annotationObservation(snapshot))}</textarea>
-      </label>
-      <label>
-        <span>Desired state</span>
-        <textarea name="desiredState" placeholder="End state" required>${escapeHtml(annotationDesiredState(snapshot))}</textarea>
-        <small data-atomicity-warning hidden></small>
-      </label>
-      <div class="local-annotator-composer-row">
-        <label>
-          <span>Change type</span>
-          <select name="changeType">
-            ${changeTypeOptions(snapshot.changeType || inferChangeType(annotationIntent(snapshot)))}
-          </select>
-        </label>
-        <label class="local-annotator-check">
-          <input name="cascade" type="checkbox"${snapshot.cascade ? " checked" : ""}>
-          <span>Cascade</span>
-        </label>
-      </div>
+      <textarea name="comment" placeholder="Describe the change you want the agent to make..." required>${escapeHtml(snapshot.comment || "")}</textarea>
       <label>
         <span>Scope</span>
         <select name="scope">
@@ -552,9 +532,8 @@
       </label>
       <label>
         <span>Reference</span>
-        <input name="referencePattern" value="${escapeAttr(snapshot.referencePattern || "")}" placeholder="Pattern">
         <div class="local-annotator-reference-row">
-          <input name="reference" value="${escapeAttr(snapshot.reference || "")}" placeholder="Example location">
+          <input name="reference" value="${escapeAttr(snapshot.reference || "")}" placeholder="Selector, file path, or attached image">
           <button type="button" data-pick-reference="true" aria-label="Pick reference element" title="Pick">${lucideIcon("mouse-pointer-2")}<span>Pick</span></button>
         </div>
       </label>
@@ -573,62 +552,38 @@
     dom.composer = composer;
     placeComposer(composer, clientX, clientY);
 
-    const observationField = composer.querySelector('textarea[name="observation"]');
-    const desiredStateField = composer.querySelector('textarea[name="desiredState"]');
-    observationField.focus();
-    observationField.setSelectionRange(observationField.value.length, observationField.value.length);
-    composer.querySelectorAll("textarea").forEach((textarea) => {
-      textarea.addEventListener("keydown", (event) => {
-        if (event.key !== "Enter" || event.shiftKey || event.isComposing) {
-          return;
-        }
+    const textarea = composer.querySelector("textarea");
+    textarea.focus();
+    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    textarea.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.shiftKey || event.isComposing) {
+        return;
+      }
 
-        event.preventDefault();
-        composer.requestSubmit();
-      });
+      event.preventDefault();
+      composer.requestSubmit();
     });
 
     composer.addEventListener("submit", async (event) => {
       event.preventDefault();
       const formData = new FormData(composer);
-      const rawObservation = String(formData.get("observation") || "");
-      const rawDesiredState = String(formData.get("desiredState") || "");
-      const observation = normalizeWhitespace(rawObservation);
-      const desiredState = normalizeWhitespace(rawDesiredState);
-      if (!observation || !desiredState) {
-        (observation ? desiredStateField : observationField).focus();
+      const comment = String(formData.get("comment") || "").trim();
+      if (!comment) {
+        textarea.focus();
         return;
       }
-
-      const atomicityMessage = atomicityIssueForDesiredState(rawDesiredState);
-      if (atomicityMessage) {
-        showAtomicityWarning(composer, atomicityMessage);
-        desiredStateField.focus();
-        toast("Split distinct changes into separate annotations.");
-        return;
-      }
-      showAtomicityWarning(composer, "");
 
       const scope = normalizeScope(formData.get("scope"));
       const targetForMetadata = targetElementForMetadata(existingAnnotation, element);
       const targetMetadata = targetForMetadata ? collectTargetMetadata(targetForMetadata, scope, snapshot.matchSignature) : null;
-      const comment = composeIntent(observation, desiredState);
       const nextAnnotation = {
         ...snapshot,
         comment,
-        observation,
-        desiredState,
-        changeType: normalizeChangeType(formData.get("changeType"), comment),
-        cascade: formData.get("cascade") === "on",
         scope,
-        referencePattern: normalizeWhitespace(formData.get("referencePattern")),
         reference: normalizeWhitespace(formData.get("reference")),
         targetFingerprint: snapshot.targetFingerprint || targetMetadata?.targetFingerprint || "",
         targetText: snapshot.targetText || targetMetadata?.targetText || "",
         snippet: targetMetadata?.snippet || snapshot.snippet || "",
-        domPath: targetMetadata?.domPath || snapshot.domPath || null,
-        boundingBox: targetMetadata?.boundingBox || snapshot.boundingBox || null,
-        computedStyle: targetMetadata?.computedStyle || snapshot.computedStyle || null,
         matchSignature: targetMetadata?.matchSignature || snapshot.matchSignature || "",
         matchedSet: scope === "element" ? null : targetMetadata?.matchedSet || snapshot.matchedSet || null,
         updatedAt: new Date().toISOString()
@@ -858,18 +813,10 @@
 
   function draftAnnotationFromComposer(composer, snapshot) {
     const formData = new FormData(composer);
-    const observation = normalizeWhitespace(formData.get("observation"));
-    const desiredState = normalizeWhitespace(formData.get("desiredState"));
-    const comment = composeIntent(observation, desiredState);
     return {
       ...snapshot,
-      comment,
-      observation,
-      desiredState,
-      changeType: normalizeChangeType(formData.get("changeType"), comment),
-      cascade: formData.get("cascade") === "on",
+      comment: String(formData.get("comment") || "").trim(),
       scope: normalizeScope(formData.get("scope")),
-      referencePattern: normalizeWhitespace(formData.get("referencePattern")),
       reference: normalizeWhitespace(formData.get("reference")),
       updatedAt: new Date().toISOString()
     };
@@ -1005,8 +952,8 @@
       marker.type = "button";
       marker.className = "local-annotator-marker";
       marker.textContent = String(index + 1);
-      marker.dataset.comment = annotationIntent(annotation) || "Annotation";
-      marker.title = `${annotation.elementSummary}\n${annotationIntent(annotation)}`;
+      marker.dataset.comment = annotation.comment || "Annotation";
+      marker.title = `${annotation.elementSummary}\n${annotation.comment}`;
 
       marker.addEventListener("click", (event) => {
         event.preventDefault();
@@ -1454,19 +1401,13 @@
     return {
       id: `ann_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
       comment: "",
-      observation: "",
-      desiredState: "",
-      changeType: "layout",
-      cascade: false,
       scope: "element",
-      referencePattern: "",
       reference: "",
       elementPath: selector,
       robustSelector: selector,
       selectorStrategy: selectorInfo.strategy,
       selectorIsPositional: selectorInfo.positional,
       fullPath,
-      domPath: targetMetadata.domPath,
       targetFingerprint: targetMetadata.targetFingerprint,
       targetText: targetMetadata.targetText,
       snippet: targetMetadata.snippet,
@@ -1508,7 +1449,6 @@
         scrollY: round(window.scrollY, 1),
         devicePixelRatio: window.devicePixelRatio
       },
-      computedStyle: targetMetadata.computedStyle || computedStyleSummary(styles),
       isFixed: ["fixed", "sticky"].includes(styles.position),
       reactComponents: react.components,
       source: react.source
@@ -1521,35 +1461,6 @@
 
   function formatAgentMarkdown(annotations) {
     return buildMarkdownExport(annotations).markdown;
-  }
-
-  function annotationObservation(annotation) {
-    return normalizeWhitespace(annotation?.observation || annotation?.comment || "");
-  }
-
-  function annotationDesiredState(annotation) {
-    return normalizeWhitespace(annotation?.desiredState || "");
-  }
-
-  function annotationIntent(annotation) {
-    const observation = annotationObservation(annotation);
-    const desiredState = annotationDesiredState(annotation);
-    if (observation && desiredState) {
-      return composeIntent(observation, desiredState);
-    }
-
-    return normalizeWhitespace(annotation?.comment || observation || desiredState || "");
-  }
-
-  function composeIntent(observation, desiredState) {
-    const parts = [];
-    if (observation) {
-      parts.push(`Observation: ${observation}`);
-    }
-    if (desiredState) {
-      parts.push(`Desired state: ${desiredState}`);
-    }
-    return parts.join(" ");
   }
 
   function buildMarkdownExport(annotations) {
@@ -1591,31 +1502,10 @@
 
     included.forEach((item, index) => {
       const { annotation } = item;
-      const intent = annotationIntent(annotation);
-      const observation = annotationObservation(annotation);
-      const desiredState = annotationDesiredState(annotation);
       lines.push(`### ${index + 1}  ·  id: ${annotation.id}`);
-      lines.push(agentLine("intent", intent));
-      if (observation) {
-        lines.push(agentLine("observation", observation));
-      }
-      if (desiredState) {
-        lines.push(agentLine("desiredState", desiredState));
-      }
-      lines.push(agentLine("changeType", normalizeChangeType(annotation.changeType, intent)));
-      lines.push(agentLine("cascade", formatCascade(annotation.cascade)));
+      lines.push(agentLine("intent", annotation.comment || ""));
       lines.push(agentLine("status", item.status.text));
       lines.push(agentLine("target", `${annotation.humanLocator || humanLocatorFromAnnotation(annotation)}   ·   anchor: ${anchorForAnnotation(annotation, item.target)}`));
-
-      const domPath = formatDomPath(item.domPath || annotation.domPath);
-      if (domPath) {
-        lines.push(agentLine("domPath", domPath));
-      }
-
-      const targetHash = item.targetFingerprint || annotation.targetFingerprint;
-      if (targetHash) {
-        lines.push(agentLine("targetHash", targetHash));
-      }
 
       const text = truncate(item.currentText || annotation.targetText || annotation.selectedText || annotation.nearbyText || "", 80);
       if (text) {
@@ -1638,25 +1528,14 @@
         lines.push(agentLine("matches", item.matches));
       }
 
-      const box = formatBoundingBox(item.boundingBox || annotation.boundingBox);
-      if (box) {
-        lines.push(agentLine("boundingBox", box));
+      if (annotation.reference) {
+        lines.push(agentLine("reference", annotation.reference));
       }
-
-      const computedStyle = formatComputedStyle(item.computedStyle || annotation.computedStyle);
-      if (computedStyle) {
-        lines.push(agentLine("computedStyle", computedStyle));
-      }
-
-      const reference = formatReference(annotation);
-      if (reference) {
-        lines.push(agentLine("reference", reference));
-      }
-      lines.push(agentLine("shot", shotExportValue(annotation)));
+      lines.push(agentLine("shot", shotNote(annotation)));
       lines.push("");
     });
 
-    lines.push("Implementation note: use the fields above as implementation context. Do not skip annotations because their screenshot is missing; the shot field includes a dataUrl when an image crop is available and an explicit failure note when it is not.");
+    lines.push("Implementation note: use the fields above as implementation context. Do not skip annotations because their screenshot is missing; the shot field only describes attachment availability.");
 
     return {
       markdown: lines.join("\n").trim() + "\n",
@@ -1671,9 +1550,8 @@
       const target = resolveAnnotationTarget(annotation).element;
       const status = statusForAnnotation(annotation, target);
       const currentText = target ? visibleElementText(target) : "";
+      const snippet = target ? outerHtmlSnippet(target) : annotation.snippet || "";
       const scope = normalizeScope(annotation.scope);
-      const targetMetadata = target ? collectTargetMetadata(target, scope, annotation.matchSignature) : null;
-      const snippet = targetMetadata?.snippet || annotation.snippet || "";
 
       summary[status.summaryKey] += 1;
 
@@ -1683,10 +1561,6 @@
         status,
         currentText,
         snippet,
-        domPath: targetMetadata?.domPath || annotation.domPath || null,
-        targetFingerprint: targetMetadata?.targetFingerprint || annotation.targetFingerprint || "",
-        boundingBox: targetMetadata?.boundingBox || annotation.boundingBox || null,
-        computedStyle: targetMetadata?.computedStyle || annotation.computedStyle || null,
         matches: scope === "element" ? "" : matchesLineForAnnotation(annotation, target, scope)
       };
     });
@@ -1750,56 +1624,6 @@
     return "screenshot unavailable; no image crop captured";
   }
 
-  function shotExportValue(annotation) {
-    const note = shotNote(annotation);
-    if (annotation.shot?.dataUrl) {
-      return `${note}; dataUrl: ${annotation.shot.dataUrl}`;
-    }
-
-    return note;
-  }
-
-  function formatReference(annotation) {
-    const pattern = normalizeWhitespace(annotation.referencePattern || "");
-    const exampleLocation = normalizeWhitespace(annotation.reference || "");
-    if (!pattern && !exampleLocation) {
-      return "";
-    }
-
-    if (pattern && exampleLocation) {
-      return `pattern: ${pattern}; exampleLocation: ${exampleLocation}`;
-    }
-
-    return pattern ? `pattern: ${pattern}` : `exampleLocation: ${exampleLocation}`;
-  }
-
-  function formatCascade(value) {
-    if (typeof value === "string") {
-      const text = normalizeWhitespace(value);
-      return text || "false";
-    }
-
-    return value ? "true" : "false";
-  }
-
-  function formatBoundingBox(box) {
-    if (!box || typeof box !== "object") {
-      return "";
-    }
-
-    return `page x=${box.x}, y=${box.y}, w=${box.width}, h=${box.height}; viewport x=${box.viewportX}, y=${box.viewportY}`;
-  }
-
-  function formatComputedStyle(styles) {
-    if (!styles || typeof styles !== "object") {
-      return "";
-    }
-
-    return Object.entries(styles)
-      .map(([key, value]) => `${key}=${value}`)
-      .join("; ");
-  }
-
   function anchorForAnnotation(annotation, target = null) {
     const selectorInfo = target ? getRobustSelectorInfo(target) : null;
     const selector = selectorInfo?.selector || annotation.robustSelector || annotation.elementPath || "";
@@ -1819,16 +1643,6 @@
       }
     }
 
-    const domPathElement = elementFromDomPath(annotation.domPath);
-    if (domPathElement && !isAnnotatorElement(domPathElement)) {
-      return { element: domPathElement, selector: formatDomPath(annotation.domPath) };
-    }
-
-    const fingerprintElement = elementByFingerprint(annotation.targetFingerprint);
-    if (fingerprintElement && !isAnnotatorElement(fingerprintElement)) {
-      return { element: fingerprintElement, selector: `targetHash:${annotation.targetFingerprint}` };
-    }
-
     return { element: null, selector: "" };
   }
 
@@ -1837,7 +1651,7 @@
       return statusValue("review", "review (target not found)");
     }
 
-    const requestedCopy = requestedCopyText(annotationIntent(annotation));
+    const requestedCopy = requestedCopyText(annotation.comment || "");
     if (requestedCopy && sameNormalizedText(visibleElementText(target), requestedCopy)) {
       return statusValue("alreadyApplied", "already-applied");
     }
@@ -1954,15 +1768,11 @@
 
   function collectTargetMetadata(element, scope = "element", preferredSignature = "") {
     const matchSignature = preferredSignature || primaryMatchSignature(element);
-    const styles = window.getComputedStyle(element);
 
     return {
       targetFingerprint: elementFingerprint(element),
       targetText: visibleElementText(element),
       snippet: outerHtmlSnippet(element),
-      domPath: structuralDomPath(element),
-      boundingBox: boundingBoxForElement(element),
-      computedStyle: computedStyleSummary(styles),
       matchSignature,
       matchedSet: normalizeScope(scope) === "element" ? null : collectMatchedSet(element, scope, matchSignature)
     };
@@ -1973,169 +1783,11 @@
   }
 
   function outerHtmlSnippet(element) {
-    return normalizedOuterHtml(element);
+    return truncate(normalizedOuterHtml(element), SNIPPET_MAX);
   }
 
   function normalizedOuterHtml(element) {
     return normalizeWhitespace(element?.outerHTML || "");
-  }
-
-  function boundingBoxForElement(element) {
-    const rect = element.getBoundingClientRect();
-    return {
-      x: round(window.scrollX + rect.left, 1),
-      y: round(window.scrollY + rect.top, 1),
-      width: round(rect.width, 1),
-      height: round(rect.height, 1),
-      viewportX: round(rect.left, 1),
-      viewportY: round(rect.top, 1)
-    };
-  }
-
-  function computedStyleSummary(styles) {
-    if (!styles) {
-      return null;
-    }
-
-    return compactObject({
-      position: styles.position,
-      display: styles.display,
-      color: styles.color,
-      backgroundColor: styles.backgroundColor,
-      fontSize: styles.fontSize,
-      fontWeight: styles.fontWeight,
-      lineHeight: styles.lineHeight,
-      margin: boxStyle(styles, "margin"),
-      padding: boxStyle(styles, "padding"),
-      border: styles.border,
-      borderRadius: styles.borderRadius,
-      gap: styles.gap,
-      alignItems: styles.alignItems,
-      justifyContent: styles.justifyContent,
-      zIndex: styles.zIndex,
-      overflow: `${styles.overflowX}/${styles.overflowY}`,
-      opacity: styles.opacity,
-      transform: styles.transform
-    });
-  }
-
-  function boxStyle(styles, prefix) {
-    const values = ["Top", "Right", "Bottom", "Left"].map((side) => styles[`${prefix}${side}`]);
-    return values.every((value) => value === values[0]) ? values[0] : values.join(" ");
-  }
-
-  function compactObject(value) {
-    return Object.fromEntries(
-      Object.entries(value || {}).filter(([_key, item]) => {
-        const text = String(item ?? "").trim();
-        return text && text !== "none" && text !== "normal" && text !== "auto" && text !== "0px" && text !== "0px 0px 0px 0px";
-      })
-    );
-  }
-
-  function structuralDomPath(element) {
-    if (!(element instanceof Element)) {
-      return null;
-    }
-
-    const indices = [];
-    let cursor = element;
-
-    while (cursor && cursor !== document.documentElement) {
-      if (cursor.id) {
-        break;
-      }
-
-      const parent = cursor.parentElement;
-      if (!parent) {
-        break;
-      }
-
-      indices.unshift(Array.from(parent.children).indexOf(cursor));
-      cursor = parent;
-    }
-
-    const anchorElement = cursor instanceof Element ? cursor : document.documentElement;
-    const anchor = anchorElement === document.documentElement
-      ? "html"
-      : `${anchorElement.tagName.toLowerCase()}#${cssEscape(anchorElement.id)}`;
-
-    return {
-      anchor,
-      indices,
-      value: formatDomPath({ anchor, indices })
-    };
-  }
-
-  function normalizeDomPathValue(value) {
-    if (!value) {
-      return null;
-    }
-
-    if (typeof value === "string") {
-      const [anchor, indicesText = ""] = value.split(">");
-      const indices = indicesText
-        .split(".")
-        .map((item) => Number(item))
-        .filter((item) => Number.isInteger(item) && item >= 0);
-      return anchor.trim() ? { anchor: anchor.trim(), indices } : null;
-    }
-
-    if (typeof value !== "object") {
-      return null;
-    }
-
-    if (!value.anchor && value.value) {
-      return normalizeDomPathValue(value.value);
-    }
-
-    const anchor = String(value.anchor || "").trim();
-    if (!anchor) {
-      return null;
-    }
-
-    const indices = Array.isArray(value.indices)
-      ? value.indices.map((item) => Number(item)).filter((item) => Number.isInteger(item) && item >= 0)
-      : [];
-
-    return { anchor, indices };
-  }
-
-  function formatDomPath(value) {
-    const path = normalizeDomPathValue(value);
-    if (!path) {
-      return "";
-    }
-
-    return path.indices.length ? `${path.anchor} > ${path.indices.join(".")}` : path.anchor;
-  }
-
-  function elementFromDomPath(value) {
-    const path = normalizeDomPathValue(value);
-    if (!path) {
-      return null;
-    }
-
-    let cursor = path.anchor === "html" ? document.documentElement : safeQuery(path.anchor);
-    for (const index of path.indices) {
-      cursor = cursor?.children?.[index] || null;
-      if (!cursor) {
-        return null;
-      }
-    }
-
-    return cursor instanceof Element ? cursor : null;
-  }
-
-  function elementByFingerprint(fingerprint) {
-    const targetHash = String(fingerprint || "").trim();
-    if (!targetHash) {
-      return null;
-    }
-
-    return Array.from(document.querySelectorAll("body *")).find((element) => {
-      return !isAnnotatorElement(element) && elementFingerprint(element) === targetHash;
-    }) || null;
   }
 
   function visibleElementText(element) {
@@ -3070,8 +2722,6 @@
   function composeContextPreview(annotation) {
     const parts = [
       `selector: ${annotation.elementPath}`,
-      `domPath: ${formatDomPath(annotation.domPath)}`,
-      `targetHash: ${annotation.targetFingerprint}`,
       `fullPath: ${annotation.fullPath}`,
       `position: ${annotation.boundingBox.x}, ${annotation.boundingBox.y} (${annotation.boundingBox.width}x${annotation.boundingBox.height})`
     ];
@@ -3093,93 +2743,6 @@
 
   function normalizeScope(value) {
     return ["element", "component", "global"].includes(String(value)) ? String(value) : "element";
-  }
-
-  function changeTypeOptions(selected) {
-    const current = CHANGE_TYPES.includes(String(selected)) ? String(selected) : "";
-    return [
-      option("", "Auto", current),
-      ...CHANGE_TYPES.map((value) => option(value, value, current))
-    ].join("");
-  }
-
-  function normalizeChangeType(value, text = "") {
-    const candidate = String(value || "");
-    return CHANGE_TYPES.includes(candidate) ? candidate : inferChangeType(text);
-  }
-
-  function inferChangeType(text) {
-    const value = normalizeWhitespace(text).toLowerCase();
-    if (/\b(color|colour|background|foreground|contrast|hue|shade|tint|blue|red|green|yellow|black|white|gray|grey)\b/.test(value)) {
-      return "color";
-    }
-
-    if (/\b(copy|text|label|headline|title|wording|caption|content|cta|sentence|paragraph)\b/.test(value)) {
-      return "copy";
-    }
-
-    if (/\b(spacing|padding|margin|gap|space|breathing room|offset)\b/.test(value)) {
-      return "spacing";
-    }
-
-    if (/\b(value|number|amount|price|count|metric|total|date|time|data)\b/.test(value)) {
-      return "data-value";
-    }
-
-    if (/\b(add|remove|delete|hide|show|insert|wrap|unwrap|group|split|reorder|move before|move after|nest|component|structure|hierarchy)\b/.test(value)) {
-      return "structure";
-    }
-
-    return "layout";
-  }
-
-  function atomicityIssueForDesiredState(value) {
-    const raw = String(value || "").trim();
-    const text = normalizeWhitespace(raw);
-    if (!text) {
-      return "";
-    }
-
-    const bulletLines = raw
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => /^(?:[-*]|\d+[.)])\s+\S/.test(line));
-    if (bulletLines.length > 1) {
-      return "Multiple desired states detected. Split them into separate annotations.";
-    }
-
-    const separatedClauses = text
-      .split(/\s*(?:;|\balso\b|\band then\b|\bthen\b)\s*/i)
-      .filter(Boolean)
-      .filter(hasChangeVerb);
-    if (separatedClauses.length > 1) {
-      return "Multiple desired states detected. Split them into separate annotations.";
-    }
-
-    const verbs = text.match(changeVerbPattern()) || [];
-    if (verbs.length > 1 && /\band\b/i.test(text)) {
-      return "Multiple desired states detected. Split them into separate annotations.";
-    }
-
-    return "";
-  }
-
-  function hasChangeVerb(value) {
-    return changeVerbPattern().test(value);
-  }
-
-  function changeVerbPattern() {
-    return /\b(add|align|change|convert|delete|fix|hide|increase|decrease|insert|make|move|remove|rename|replace|resize|reorder|retitle|set|show|split|update|wrap)\b/gi;
-  }
-
-  function showAtomicityWarning(composer, message) {
-    const warning = composer.querySelector("[data-atomicity-warning]");
-    if (!warning) {
-      return;
-    }
-
-    warning.textContent = message;
-    warning.hidden = !message;
   }
 
   function lucideIcon(name) {
